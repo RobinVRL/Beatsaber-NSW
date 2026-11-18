@@ -23,6 +23,7 @@
 
 #include "egl_bridge.h"
 #include "joycon_bridge.h"
+#include "joycon_tracker.h"
 #include "openxr_runtime.h"
 #include "il2cpp_probe.h"
 #include "so_util.h"
@@ -185,6 +186,9 @@ typedef struct {
     Quat prev_raw;                    /* last raw HID orientation */
     int has_prev;
     int has_motion;
+    BsJcTracker tracker;              /* estimated 6DoF (arm + inertial) */
+    uint64_t last_motion_seq;
+    XrTime last_motion_t;
 } BsHand;
 /* Horizon's fused direction matrix convention (body->world or its
  * transpose) is detected at runtime: frame-to-frame orientation deltas must
@@ -436,13 +440,32 @@ static void poll_input(void) {
             Quat body_to_world = g_motion_conv < 0 ? qconj(raw) : raw;
             Quat cur = sensor_to_xr((const float[4]){body_to_world.x, body_to_world.y,
                                                      body_to_world.z, body_to_world.w});
-            if (!hand->calibrated || recenter) motion_recenter(hand, h, cur);
+            if (!hand->calibrated || recenter) {
+                motion_recenter(hand, h, cur);
+                bs_jc_tracker_reset(&hand->tracker, NULL, h);
+                hand->last_motion_t = 0;
+            }
             /* World-frame rotation since recenter, expressed with the
              * recenter heading removed, so turning about gravity is always
              * yaw no matter how the Joy-Con is held. */
             Quat d = qmul(cur, qconj(hand->ref));
             hand->motion = qmul(qmul(hand->heading, d), qconj(hand->heading));
             hand->has_motion = 1;
+            /* Feed the estimator once per fresh HID sample so integration
+             * dt follows the sensor, not the app's sync cadence. */
+            if (s->motion_sampling_number != hand->last_motion_seq ||
+                !hand->last_motion_t) {
+                float mdt = hand->last_motion_t ?
+                            (float)(t - hand->last_motion_t) * 1e-9f : 0.0f;
+                hand->last_motion_t = t;
+                hand->last_motion_seq = s->motion_sampling_number;
+                Quat aim = qnorm(qmul(hand->motion, hand->base));
+                Quat world = qnorm(qmul(hand->heading, cur));
+                bs_jc_tracker_update(&hand->tracker,
+                                     (const float[4]){aim.x, aim.y, aim.z, aim.w},
+                                     (const float[4]){world.x, world.y, world.z, world.w},
+                                     s->acceleration_g, s->angular_velocity_rad_s, mdt);
+            }
         } else {
             hand->has_motion = 0;
             hand->has_prev = 0;
@@ -468,13 +491,13 @@ static Pose hand_pose_world(int side) {
     Vec3 off = {h ? 0.20f : -0.20f, -0.22f, -0.40f};
     float j = tracking_jitter();
     if (g_hands[h].has_motion && !g_auto_aim[h]) {
-        /* Gyro aim plus a simple elbow arm model: rotating the Joy-Con swings
-         * the hand around the elbow, so wrist flicks cut through space. At
-         * the recentered aim this reproduces the stick-aim hand position. */
-        Quat q = qnorm(qmul(g_hands[h].motion, g_hands[h].base));
-        Vec3 elbow = {h ? 0.20f : -0.20f, -0.37f, -0.08f};
-        Vec3 hand_off = vadd(elbow, qrot(q, (Vec3){0, 0, -0.35f}));
-        hand_off.x += j;
+        /* Estimated 6DoF: One-Euro filtered, gyro-predicted orientation on
+         * a shoulder/elbow/wrist arm model, plus accelerometer residual
+         * translation (see joycon_tracker.h). */
+        float tq[4], tp[3];
+        bs_jc_tracker_pose(&g_hands[h].tracker, tq, tp);
+        Quat q = qnorm((Quat){tq[0], tq[1], tq[2], tq[3]});
+        Vec3 hand_off = {tp[0] + j, tp[1], tp[2]};
         return (Pose){qmul(yaw_only, q), vadd(head.p, qrot(yaw_only, hand_off))};
     }
     Quat q = yaw_pitch(g_hands[h].yaw + j, g_hands[h].pitch);

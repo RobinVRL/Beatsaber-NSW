@@ -12,6 +12,8 @@ Android, Bionic, JNI, EGL/GLES and OpenXR APIs that they expect.
 
 ## Status
 
+This port is coded with AI assistance.
+
 | Area | State |
 |---|---|
 | Boot: native constructors, JNI, IL2CPP, Unity GameActivity | Working |

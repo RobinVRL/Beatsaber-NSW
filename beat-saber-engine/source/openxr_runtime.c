@@ -185,10 +185,6 @@ typedef struct {
     Quat prev_raw;                    /* last raw HID orientation */
     int has_prev;
     int has_motion;
-    /* Accelerometer pseudo-6DoF (XR axes, heading removed, metres). */
-    Vec3 grav;                        /* low-passed world accel = gravity */
-    Vec3 vel, pos;
-    int grav_ready;
 } BsHand;
 /* Horizon's fused direction matrix convention (body->world or its
  * transpose) is detected at runtime: frame-to-frame orientation deltas must
@@ -385,39 +381,7 @@ static void motion_recenter(BsHand *hand, int h, Quat cur) {
     hand->heading = yaw_pitch(-heading, 0);
     hand->base = yaw_pitch(h ? 0.05f : -0.05f, 0.44f);
     hand->calibrated = 1;
-    hand->vel = hand->pos = (Vec3){0, 0, 0};
     XRLOG("hand %d motion recentered (heading %.0f deg)\n", h, heading * 57.29578f);
-}
-
-/* Accelerometer-only position: true 6DoF is impossible (double-integrated
- * accel drifts metres per second), so this is a damped, self-centering
- * "punch" offset: gravity is removed with a slow low-pass, the remainder is
- * integrated with leaky velocity and a spring pulling position back home.
- * Swings move the saber; holding still settles it back to the arm model. */
-static void motion_accel(BsHand *hand, Quat body_to_world, const float a_g[3], float dt) {
-    if (dt <= 0) return;
-    Vec3 aw = qrot(body_to_world, (Vec3){a_g[0], a_g[1], a_g[2]});
-    Vec3 a = {aw.x, aw.z, -aw.y};                 /* HID world -> XR axes */
-    if (!hand->grav_ready) { hand->grav = a; hand->grav_ready = 1; }
-    float k = dt / (0.6f + dt);                   /* gravity low-pass */
-    hand->grav = vadd(hand->grav, (Vec3){(a.x - hand->grav.x) * k,
-                      (a.y - hand->grav.y) * k, (a.z - hand->grav.z) * k});
-    Vec3 lin = {(a.x - hand->grav.x) * 9.81f, (a.y - hand->grav.y) * 9.81f,
-                (a.z - hand->grav.z) * 9.81f};
-    float mag = sqrtf(lin.x*lin.x + lin.y*lin.y + lin.z*lin.z);
-    if (mag < 0.6f) lin = (Vec3){0, 0, 0};        /* sensor noise dead zone */
-    lin = qrot(hand->heading, lin);
-    const float gain = 0.6f;
-    float vdamp = expf(-dt / 0.18f), pdamp = expf(-dt / 0.45f);
-    hand->vel = (Vec3){(hand->vel.x + lin.x * gain * dt) * vdamp,
-                       (hand->vel.y + lin.y * gain * dt) * vdamp,
-                       (hand->vel.z + lin.z * gain * dt) * vdamp};
-    Vec3 p = {(hand->pos.x + hand->vel.x * dt) * pdamp,
-              (hand->pos.y + hand->vel.y * dt) * pdamp,
-              (hand->pos.z + hand->vel.z * dt) * pdamp};
-    float pm = sqrtf(p.x*p.x + p.y*p.y + p.z*p.z);
-    if (pm > 0.35f) { float s = 0.35f / pm; p = (Vec3){p.x*s, p.y*s, p.z*s}; }
-    hand->pos = p;
 }
 
 /* Reset combo: hold both stick clicks for 0.5 s -> recenter both hands. */
@@ -478,8 +442,6 @@ static void poll_input(void) {
              * yaw no matter how the Joy-Con is held. */
             Quat d = qmul(cur, qconj(hand->ref));
             hand->motion = qmul(qmul(hand->heading, d), qconj(hand->heading));
-            if (s->capabilities & BS_JOYCON_CAP_ACCELEROMETER)
-                motion_accel(hand, body_to_world, s->acceleration_g, dt);
             hand->has_motion = 1;
         } else {
             hand->has_motion = 0;
@@ -511,7 +473,7 @@ static Pose hand_pose_world(int side) {
          * the recentered aim this reproduces the stick-aim hand position. */
         Quat q = qnorm(qmul(g_hands[h].motion, g_hands[h].base));
         Vec3 elbow = {h ? 0.20f : -0.20f, -0.37f, -0.08f};
-        Vec3 hand_off = vadd(vadd(elbow, qrot(q, (Vec3){0, 0, -0.35f})), g_hands[h].pos);
+        Vec3 hand_off = vadd(elbow, qrot(q, (Vec3){0, 0, -0.35f}));
         hand_off.x += j;
         return (Pose){qmul(yaw_only, q), vadd(head.p, qrot(yaw_only, hand_off))};
     }

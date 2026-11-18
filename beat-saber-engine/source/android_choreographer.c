@@ -74,8 +74,18 @@ BsChoreographer *bs_choreographer_get_instance(void) {
         if (!entry && !current->initialized) entry = current;
     }
     if (entry && !entry->initialized) {
+#if defined(__SWITCH2__)
+        /* Under kaiHEN the display belongs to OunceVK; a second VI session
+         * from here never returned (frames never started, kaiHEN went down
+         * after). Pace with the timer instead and never touch VI. */
+        Result rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+        debugPrintf("[choreographer] Switch 2: VI vsync skipped\n");
+        if (0) {
+#else
+        debugPrintf("[choreographer] opening VI vsync\n");
         Result rc = viInitialize(ViServiceType_Default);
         if (R_SUCCEEDED(rc)) {
+#endif
             rc = viOpenDefaultDisplay(&entry->display);
             if (R_SUCCEEDED(rc)) {
                 rc = viGetDisplayVsyncEvent(&entry->display, &entry->vsync);

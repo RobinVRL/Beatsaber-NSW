@@ -28,6 +28,17 @@
 #include "so_util.h"
 #include "util.h"
 
+/* IL2CPP object probes are debug-only (they fault on hardware). */
+static int il2cpp_probe_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        FILE *f = fopen("sdmc:/switch/beat-saber-quest/il2cpp_probe", "r");
+        enabled = f != NULL;
+        if (f) fclose(f);
+    }
+    return enabled;
+}
+
 #define XRLOG(...) debugPrintf("[xr:rt] " __VA_ARGS__)
 
 /* Not under XR_USE_PLATFORM_ANDROID here (avoids jni.h); same layout. */
@@ -174,6 +185,10 @@ typedef struct {
     Quat prev_raw;                    /* last raw HID orientation */
     int has_prev;
     int has_motion;
+    /* Accelerometer pseudo-6DoF (XR axes, heading removed, metres). */
+    Vec3 grav;                        /* low-passed world accel = gravity */
+    Vec3 vel, pos;
+    int grav_ready;
 } BsHand;
 /* Horizon's fused direction matrix convention (body->world or its
  * transpose) is detected at runtime: frame-to-frame orientation deltas must
@@ -370,8 +385,43 @@ static void motion_recenter(BsHand *hand, int h, Quat cur) {
     hand->heading = yaw_pitch(-heading, 0);
     hand->base = yaw_pitch(h ? 0.05f : -0.05f, 0.44f);
     hand->calibrated = 1;
+    hand->vel = hand->pos = (Vec3){0, 0, 0};
     XRLOG("hand %d motion recentered (heading %.0f deg)\n", h, heading * 57.29578f);
 }
+
+/* Accelerometer-only position: true 6DoF is impossible (double-integrated
+ * accel drifts metres per second), so this is a damped, self-centering
+ * "punch" offset: gravity is removed with a slow low-pass, the remainder is
+ * integrated with leaky velocity and a spring pulling position back home.
+ * Swings move the saber; holding still settles it back to the arm model. */
+static void motion_accel(BsHand *hand, Quat body_to_world, const float a_g[3], float dt) {
+    if (dt <= 0) return;
+    Vec3 aw = qrot(body_to_world, (Vec3){a_g[0], a_g[1], a_g[2]});
+    Vec3 a = {aw.x, aw.z, -aw.y};                 /* HID world -> XR axes */
+    if (!hand->grav_ready) { hand->grav = a; hand->grav_ready = 1; }
+    float k = dt / (0.6f + dt);                   /* gravity low-pass */
+    hand->grav = vadd(hand->grav, (Vec3){(a.x - hand->grav.x) * k,
+                      (a.y - hand->grav.y) * k, (a.z - hand->grav.z) * k});
+    Vec3 lin = {(a.x - hand->grav.x) * 9.81f, (a.y - hand->grav.y) * 9.81f,
+                (a.z - hand->grav.z) * 9.81f};
+    float mag = sqrtf(lin.x*lin.x + lin.y*lin.y + lin.z*lin.z);
+    if (mag < 0.6f) lin = (Vec3){0, 0, 0};        /* sensor noise dead zone */
+    lin = qrot(hand->heading, lin);
+    const float gain = 0.6f;
+    float vdamp = expf(-dt / 0.18f), pdamp = expf(-dt / 0.45f);
+    hand->vel = (Vec3){(hand->vel.x + lin.x * gain * dt) * vdamp,
+                       (hand->vel.y + lin.y * gain * dt) * vdamp,
+                       (hand->vel.z + lin.z * gain * dt) * vdamp};
+    Vec3 p = {(hand->pos.x + hand->vel.x * dt) * pdamp,
+              (hand->pos.y + hand->vel.y * dt) * pdamp,
+              (hand->pos.z + hand->vel.z * dt) * pdamp};
+    float pm = sqrtf(p.x*p.x + p.y*p.y + p.z*p.z);
+    if (pm > 0.35f) { float s = 0.35f / pm; p = (Vec3){p.x*s, p.y*s, p.z*s}; }
+    hand->pos = p;
+}
+
+/* Reset combo: hold both stick clicks for 0.5 s -> recenter both hands. */
+static float g_reset_hold;
 
 static void poll_input(void) {
     XrTime t = now_ns();
@@ -390,6 +440,17 @@ static void poll_input(void) {
 
     BsJoyconSnapshot snap;
     int have = bs_joycon_poll(&snap) == 0;
+    int reset_all = 0;
+    if ((g_buttons & HidNpadButton_StickL) && (g_buttons & HidNpadButton_StickR)) {
+        float before = g_reset_hold;
+        g_reset_hold += dt;
+        if (before < 0.5f && g_reset_hold >= 0.5f) {
+            reset_all = 1;
+            XRLOG("reset combo: recentering both controllers\n");
+        }
+    } else {
+        g_reset_hold = 0;
+    }
     for (int h = 0; h < 2; ++h) {
         BsHand *hand = &g_hands[h];
         const BsJoyconHandSample *s = have ? &snap.hands[h] : NULL;
@@ -402,7 +463,7 @@ static void poll_input(void) {
                                (g_buttons & HidNpadButton_R)
                              : (g_buttons & HidNpadButton_StickL) &&
                                (g_buttons & HidNpadButton_L);
-            if (!hand->has_motion) recenter = 1; /* (re)connected */
+            if (!hand->has_motion || reset_all) recenter = 1; /* (re)connected */
             if (g_motion_conv == 0 && hand->has_prev && motion_detect_convention(
                     hand->prev_raw, raw, s->angular_velocity_rad_s))
                 recenter = 1;
@@ -417,6 +478,8 @@ static void poll_input(void) {
              * yaw no matter how the Joy-Con is held. */
             Quat d = qmul(cur, qconj(hand->ref));
             hand->motion = qmul(qmul(hand->heading, d), qconj(hand->heading));
+            if (s->capabilities & BS_JOYCON_CAP_ACCELEROMETER)
+                motion_accel(hand, body_to_world, s->acceleration_g, dt);
             hand->has_motion = 1;
         } else {
             hand->has_motion = 0;
@@ -448,7 +511,7 @@ static Pose hand_pose_world(int side) {
          * the recentered aim this reproduces the stick-aim hand position. */
         Quat q = qnorm(qmul(g_hands[h].motion, g_hands[h].base));
         Vec3 elbow = {h ? 0.20f : -0.20f, -0.37f, -0.08f};
-        Vec3 hand_off = vadd(elbow, qrot(q, (Vec3){0, 0, -0.35f}));
+        Vec3 hand_off = vadd(vadd(elbow, qrot(q, (Vec3){0, 0, -0.35f})), g_hands[h].pos);
         hand_off.x += j;
         return (Pose){qmul(yaw_only, q), vadd(head.p, qrot(yaw_only, hand_off))};
     }
@@ -1086,7 +1149,8 @@ static XrResult XRAPI_CALL rt_xrEndFrame(XrSession s, const XrFrameEndInfo *ei) 
         static const char *const filters[] = {"Vector3Control", "QuaternionControl", NULL};
         bs_il2cpp_probe(filters);
     }
-    if (g_end_count == 300 || g_end_count == 1500) bs_il2cpp_probe_xr_devices();
+    if ((g_end_count == 300 || g_end_count == 1500) && il2cpp_probe_enabled())
+        bs_il2cpp_probe_xr_devices();
     if (g_end_count == 1 || g_end_count == 60 || g_end_count % 3000 == 0)
         XRLOG("xrEndFrame #%llu layers=%u presented=%d input: sync=%lu hand-locate=%lu bool=%lu float=%lu vec2=%lu pose=%lu\n",
               (unsigned long long)g_end_count, ei->layerCount, presented, g_n_sync,
@@ -1207,12 +1271,10 @@ static XrResult XRAPI_CALL rt_xrGetCurrentInteractionProfile(XrSession s, XrPath
 static XrResult XRAPI_CALL rt_xrSyncActions(XrSession s, const XrActionsSyncInfo *si) {
     (void)s; (void)si;
     ++g_n_sync;
-    if (g_n_sync == 1500 || g_n_sync == 3000) {
-        static const char *const names[] = {"VRController", "UnityXRSystemState",
-            "DeactivateVRControllersOnFocusCapture", "UnityXRHelper", NULL};
+    /* Diagnostic only: guesses object fields by address and faults on
+     * hardware (crash right after the EULA). Opt in with an SD flag file. */
+    if ((g_n_sync == 1500 || g_n_sync == 3000) && il2cpp_probe_enabled())
         bs_il2cpp_probe_helper_actions();
-        (void)names;
-    }
     mutexLock(&g_lock);
     poll_input();
     mutexUnlock(&g_lock);

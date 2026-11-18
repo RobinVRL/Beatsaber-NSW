@@ -104,6 +104,9 @@ static void *bs_android_dlopen(const char *name, int flags) {
      * Only return a handle when the real libnx PCM bridge exports exist.
      * OpenSL ES has a different object/vtable ABI and is not substituted.
      */
+    if (!strcmp(base, "libaaudio.so") || !strcmp(base, "libOpenSLES.so"))
+        debugPrintf("[audio] guest dlopen(%s)%s\n", name,
+                    strcmp(base, "libaaudio.so") ? " -> unavailable" : "");
     if (!strcmp(base, "libaaudio.so") && bs_android_audio_exports_count)
         return &g_aaudio_loader_handle;
     so_module *module = so_find_module_by_name(name);

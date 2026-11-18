@@ -60,6 +60,7 @@ size_t bs_android_audio_pcm_to_s16_stereo(
 #include <malloc.h>
 #include <switch.h>
 #include <time.h>
+#include "util.h"
 
 /* Stream states are atomic because guest JNI/FMOD queries can run on other
  * threads. The guest callback is never invoked under an audout mutex. */
@@ -100,6 +101,7 @@ struct AAudioStream {
     _Atomic uint64_t frames_written;
     _Atomic uint64_t frames_played_device;
     _Atomic uint32_t underruns;
+    uint64_t callbacks;
 
     AudioOutBuffer out[BS_OUTPUT_BUFFERS];
     bool queued[BS_OUTPUT_BUFFERS];
@@ -149,6 +151,10 @@ static bool bs_pcm_input_frame(AAudioStream *stream, float out[2])
         memset(stream->input, 0, bytes);
         int32_t rc = stream->callback(stream, stream->userdata,
                                       stream->input, stream->callback_frames);
+        if (++stream->callbacks == 1 || rc != 0)
+            debugPrintf("[audio] data callback #%llu (%d frames) -> %d\n",
+                        (unsigned long long)stream->callbacks,
+                        stream->callback_frames, rc);
         if (rc != 0) stream->callback_done = true;
         stream->input_frames = stream->callback_frames;
         stream->input_pos = 0;
@@ -216,6 +222,7 @@ static int bs_fill_output(AAudioStream *s, int16_t *dst)
 
 static void bs_worker_failure(AAudioStream *s, int32_t error)
 {
+    debugPrintf("[audio] output failed (AAudio error %d): stream disconnected\n", error);
     atomic_store(&s->state, BS_AAUDIO_STATE_DISCONNECTED);
     if (s->error_callback)
         s->error_callback(s, s->error_userdata, error);
@@ -224,7 +231,9 @@ static void bs_worker_failure(AAudioStream *s, int32_t error)
 static void bs_audio_worker(void *userdata)
 {
     AAudioStream *s = (AAudioStream *)userdata;
+    debugPrintf("[audio] worker started\n");
     if (!s->guest_init(s->guest_init_context)) {
+        debugPrintf("[audio] guest thread init failed: no audio\n");
         /* The guest error callback would need exactly the same Bionic TLS.
          * A failed initialization therefore cannot call guest code at all. */
         atomic_store(&s->state, BS_AAUDIO_STATE_DISCONNECTED);
@@ -233,6 +242,8 @@ static void bs_audio_worker(void *userdata)
 
     bool output_running = false;
     unsigned queued_count = 0;
+    unsigned stat_buffers = 0;
+    int stat_peak = 0;
     while (!atomic_load(&s->quit)) {
         int32_t state = atomic_load(&s->state);
         if (state == BS_AAUDIO_STATE_STARTING ||
@@ -248,10 +259,26 @@ static void bs_audio_worker(void *userdata)
                 AudioOutBuffer *b = &s->out[i];
                 int frames = bs_fill_output(s, (int16_t *)b->buffer);
                 if (!frames) { s->source_done = true; break; }
+                {
+                    const int16_t *pcm = (const int16_t *)b->buffer;
+                    for (int k = 0; k < frames * 2; ++k) {
+                        int v = pcm[k] < 0 ? -pcm[k] : pcm[k];
+                        if (v > stat_peak) stat_peak = v;
+                    }
+                    if (++stat_buffers % (BS_OUTPUT_RATE * 10 / BS_OUTPUT_FRAMES) == 0) {
+                        debugPrintf("[audio] stats: %llu callbacks, %u underruns, "
+                                    "peak %d/32767 over last 10 s\n",
+                                    (unsigned long long)s->callbacks,
+                                    (unsigned)atomic_load(&s->underruns), stat_peak);
+                        stat_peak = 0;
+                    }
+                }
                 b->data_offset = 0;
                 b->data_size = (uint64_t)BS_OUTPUT_FRAMES * 2 * sizeof(int16_t);
                 armDCacheFlush(b->buffer, (size_t)b->data_size);
-                if (R_FAILED(audoutAppendAudioOutBuffer(b))) {
+                Result append_rc = audoutAppendAudioOutBuffer(b);
+                if (R_FAILED(append_rc)) {
+                    debugPrintf("[audio] audoutAppendAudioOutBuffer -> 0x%x\n", append_rc);
                     bs_worker_failure(s, BS_AAUDIO_ERROR_INTERNAL);
                     break;
                 }
@@ -266,7 +293,9 @@ static void bs_audio_worker(void *userdata)
             }
             if (!queued_count) { svcSleepThread(1000000ULL); continue; }
             if (!output_running) {
-                if (R_FAILED(audoutStartAudioOut())) {
+                Result start_rc = audoutStartAudioOut();
+                debugPrintf("[audio] audoutStartAudioOut -> 0x%x\n", start_rc);
+                if (R_FAILED(start_rc)) {
                     bs_worker_failure(s, BS_AAUDIO_ERROR_INTERNAL);
                     break;
                 }
@@ -440,6 +469,13 @@ int32_t AAudioStreamBuilder_openStream(AAudioStreamBuilder *b, AAudioStream **ou
         s->out[i].buffer_size = BS_OUTPUT_FRAMES * 4;
     }
     Result rc = audoutInitialize();
+    debugPrintf("[audio] openStream rate=%d ch=%d fmt=%d cb=%d perf=%d share=%d: "
+                "audoutInitialize -> 0x%x (device %u Hz, %u ch, pcm %d)\n",
+                s->rate, s->channels, s->format, s->callback_frames,
+                b->performance_mode, b->sharing_mode, rc,
+                R_SUCCEEDED(rc) ? audoutGetSampleRate() : 0,
+                R_SUCCEEDED(rc) ? audoutGetChannelCount() : 0,
+                R_SUCCEEDED(rc) ? (int)audoutGetPcmFormat() : -1);
     if (R_FAILED(rc)) {
         for (unsigned i = 0; i < BS_OUTPUT_BUFFERS; ++i) free(s->out[i].buffer);
         free(s);
@@ -465,6 +501,7 @@ int32_t AAudioStream_requestStart(AAudioStream *s)
 {
     if (!s) return BS_AAUDIO_ERROR_NULL;
     int state = atomic_load(&s->state);
+    debugPrintf("[audio] requestStart (state %d)\n", state);
     if (state == BS_AAUDIO_STATE_STARTED ||
         state == BS_AAUDIO_STATE_STARTING) return 0;
     if (state != BS_AAUDIO_STATE_OPEN &&
@@ -481,7 +518,10 @@ int32_t AAudioStream_requestStart(AAudioStream *s)
         s->guest_init_context = g_guest_init_context;
         mutexUnlock(&g_audio_lock);
     }
-    if (!s->guest_init) return BS_AAUDIO_ERROR_UNAVAILABLE;
+    if (!s->guest_init) {
+        debugPrintf("[audio] requestStart: no guest thread hook\n");
+        return BS_AAUDIO_ERROR_UNAVAILABLE;
+    }
     if (state == BS_AAUDIO_STATE_STOPPED) {
         s->input_frames = s->input_pos = 0;
         s->callback_done = s->have_current = s->have_next = false;
@@ -527,6 +567,7 @@ int32_t AAudioStream_requestStop(AAudioStream *s)
         state != BS_AAUDIO_STATE_STARTING &&
         state != BS_AAUDIO_STATE_PAUSED)
         return BS_AAUDIO_ERROR_INVALID_STATE;
+    debugPrintf("[audio] requestStop\n");
     atomic_store(&s->state, BS_AAUDIO_STATE_STOPPING);
     return 0;
 }

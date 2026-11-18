@@ -529,13 +529,10 @@ _Atomic unsigned long bs_gl_clears, bs_gl_draws, bs_gl_fbo_binds, bs_gl_flushes;
  * The Quest build ships only multiview stereo shader variants. Mesa nouveau
  * has no OVR_multiview, and without it Unity picks single-pass instancing,
  * finds no instancing variants, and falls back to mono shaders (the final
- * array blit then samples the default grey texture). Emulate multiview with
- * layered rendering:
- *  - glFramebufferTextureMultiviewOVR attaches the whole array (layered);
- *  - vertex shaders run two instances per requested instance, view = the
- *    low instance bit, written to gl_Layer (GL_NV_viewport_array2);
- *  - fragment shaders read the view back from gl_Layer;
- *  - draws into a multiview framebuffer double their instance count. */
+ * array blit then samples the default grey texture). Keep Unity's layered
+ * framebuffer layout and route emulated multiview shaders to layer zero.
+ * The flat-screen OpenXR runtime presents only that eye. Duplicating each
+ * instance across both layers produces stretched triangles in Eden. */
 #define BS_GL_MAX_VIEWS_OVR 0x9631
 #define BS_GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR 0x9630
 #define BS_GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR 0x9632
@@ -554,19 +551,19 @@ static void mv_mark(GLenum target, GLenum attachment, int on) {
     GLuint f = bound_fbo(target);
     if (f && f < BS_MV_MAX_FBO) g_mv_fbo[f] = (unsigned char)on;
 }
-/* Per-object multiview state. Only programs whose vertex shader was rewritten
- * route instance bit 0 to gl_Layer; doubling a draw of any other program
- * renders it twice into layer 0 (additive glows/fog turn white). Unknown
- * programs (e.g. from glProgramBinary) keep the doubling. */
+/* Per-object multiview state for framebuffer and shader diagnostics. */
 #define BS_MV_MAX_IDS 65536
 enum { BS_PROG_UNKNOWN = 0, BS_PROG_MV = 1, BS_PROG_MONO = 2 };
 static unsigned char g_shader_mv[BS_MV_MAX_IDS];   /* 1 mv vertex, 2 mono vertex */
 static unsigned char g_prog_mv[BS_MV_MAX_IDS];
 static unsigned short g_prog_vs[BS_MV_MAX_IDS], g_prog_fs[BS_MV_MAX_IDS];
+static unsigned short g_prog_fs_sh[BS_MV_MAX_IDS]; /* fragment shader object */
 static unsigned short g_shader_seq[BS_MV_MAX_IDS];   /* dump file number */
 static unsigned char g_shader_cut[BS_MV_MAX_IDS], g_prog_cut[BS_MV_MAX_IDS]; /* note-family VS */
 /* Compute shaders that build the bloom pre-pass light quads. */
 static unsigned char g_shader_light[BS_MV_MAX_IDS], g_prog_light[BS_MV_MAX_IDS];
+static unsigned char g_shader_ui[BS_MV_MAX_IDS], g_prog_ui[BS_MV_MAX_IDS]; /* _ClipRect FS */
+static unsigned char g_shader_note_body[BS_MV_MAX_IDS], g_prog_note_body[BS_MV_MAX_IDS];
 static int prog_is_mono(GLuint p) {
     return p < BS_MV_MAX_IDS && g_prog_mv[p] == BS_PROG_MONO;
 }
@@ -667,6 +664,11 @@ static void bs_glGetIntegerv(GLenum pname, GLint *v) {
     if (pname == BS_GL_MAX_VIEWS_OVR) { *v = 2; return; }
     glGetIntegerv(pname, v);
     if (pname == GL_NUM_EXTENSIONS) *v += BS_EXTRA_EXT;
+    if (pname == 0x8A30 /* GL_MAX_UNIFORM_BLOCK_SIZE */ || pname == 0x8B4A /* MAX_VERTEX_UNIFORM_COMPONENTS */ ||
+        pname == 0x8DFB /* MAX_VERTEX_UNIFORM_VECTORS */ || pname == 0x8A2B /* MAX_VERTEX_UNIFORM_BLOCKS */) {
+        static int n;
+        if (n++ < 8) debugPrintf("[gles] glGetIntegerv(0x%x) = %d\n", pname, *v);
+    }
 }
 static const GLubyte *bs_glGetStringi(GLenum name, GLuint index) {
     if (name == GL_EXTENSIONS && !native_mv()) {
@@ -749,15 +751,15 @@ static char *mv_rewrite(const char *src) {
         s = str_replace_all(s, "gl_InstanceID", "bs_InstanceID");
         s = insert_after_directives(s,
             "#extension GL_NV_viewport_array2 : require\n"
-            "#define bs_ViewID uint(gl_InstanceID & 1)\n"
-            "#define bs_InstanceID (gl_InstanceID >> 1)\n"
+            "#define bs_ViewID 0u\n"
+            "#define bs_InstanceID gl_InstanceID\n"
             "#define main bs_MultiviewMain\n");
         /* Set the eye layer before calling the original entry point, even
          * when its declaration spans lines or uses a void parameter list. */
         const char entry[] =
             "\n#undef main\n"
             "void main() {\n"
-            "    gl_Layer = int(gl_InstanceID & 1);\n"
+            "    gl_Layer = 0;\n"
             "    bs_MultiviewMain();\n"
             "}\n";
         size_t length = strlen(s);
@@ -1111,6 +1113,85 @@ static char *idx_div_to_shift(char *s, int *changed) {
     return out;
 }
 
+/* std140 size of `struct <type> { ... };` in s, or 0 if not found. */
+static size_t std140_struct_size(const char *s, const char *type, size_t tl) {
+    const char *p = s;
+    while ((p = strstr(p, "struct "))) {
+        p += 7;
+        if (strncmp(p, type, tl) || (p[tl] != ' ' && p[tl] != '{' && p[tl] != '\n')) continue;
+        const char *b = strchr(p, '{'), *e = b ? strstr(b, "};") : NULL;
+        if (!b || !e) return 0;
+        size_t off = 0;
+        for (const char *ln = b + 1; ln < e;) {
+            const char *nl = memchr(ln, '\n', (size_t)(e - ln));
+            const char *end = nl ? nl : e;
+            char buf[160];
+            size_t n = (size_t)(end - ln) < sizeof buf - 1 ? (size_t)(end - ln) : sizeof buf - 1;
+            memcpy(buf, ln, n); buf[n] = '\0';
+            ln = nl ? nl + 1 : e;
+            if (!strchr(buf, ';')) continue;
+            /* type is the last type-like word before the member name. */
+            size_t al = 4, sz = 4;
+            if (strstr(buf, "mat4")) { al = 16; sz = 64; }
+            else if (strstr(buf, "mat3")) { al = 16; sz = 48; }
+            else if (strstr(buf, "vec4")) { al = 16; sz = 16; }
+            else if (strstr(buf, "vec3")) { al = 16; sz = 12; }
+            else if (strstr(buf, "vec2")) { al = 8; sz = 8; }
+            const char *br = strchr(buf, '[');
+            if (br) { /* arrays: every element aligned/strided to 16 */
+                long cnt = strtol(br + 1, NULL, 10);
+                if (cnt <= 0) return 0;
+                size_t stride = sz > 16 ? (sz + 15) & ~(size_t)15 : 16;
+                al = 16; sz = stride * (size_t)cnt;
+            }
+            off = (off + al - 1) & ~(al - 1);
+            off += sz;
+        }
+        return (off + 15) & ~(size_t)15;
+    }
+    return 0;
+}
+/* Unity patches UNITY_RUNTIME_INSTANCING_ARRAY_SIZE into a padded slot
+ * ("[2<34 spaces>]") but leaves 2 here, while issuing draws of up to ~70
+ * instances; instances past the second then read out of bounds (far notes
+ * collapse, lasers get garbage widths). Size each array to fill the 64 KiB
+ * uniform block instead. */
+static char *fix_instancing_arrays(char *s, int *fixed) {
+    static const char pad[] = "[2          ";
+    char *p = s;
+    while ((p = strstr(p, pad))) {
+        char *close = p + 2;
+        while (*close == ' ') ++close;
+        if (*close != ']') { p += 2; continue; }
+        /* "UNITY_UNIFORM <Type>   <name>[" -> Type */
+        char *ls = p;
+        while (ls > s && ls[-1] != '\n') --ls;
+        char *t = strstr(ls, "UNITY_UNIFORM");
+        size_t size = 0;
+        if (t && t < p) {
+            t += 13;
+            while (*t == ' ' || *t == '\t') ++t;
+            char *te = t;
+            while (te < p && *te != ' ' && *te != '\t') ++te;
+            size = std140_struct_size(s, t, (size_t)(te - t));
+        }
+        if (size) {
+            size_t count = 65536 / size;
+            if (count > 1024) count = 1024;
+            char num[24];
+            int nl = snprintf(num, sizeof num, "%zu", count);
+            size_t slot = (size_t)(close - (p + 1));
+            if ((size_t)nl <= slot) {
+                memset(p + 1, ' ', slot);
+                memcpy(p + 1, num, (size_t)nl);
+                ++*fixed;
+            }
+        }
+        p = close;
+    }
+    return s;
+}
+
 static void bs_glShaderSource(GLuint sh, GLsizei n, const GLchar *const *src, const GLint *len) {
     size_t total = 0;
     for (GLsizei i = 0; i < n; ++i)
@@ -1138,6 +1219,7 @@ static void bs_glShaderSource(GLuint sh, GLsizei n, const GLchar *const *src, co
         if (dump_all) mkdir("sdmc:/switch/beat-saber-quest/shaderdump", 0777);
     }
     if (sh < BS_MV_MAX_IDS) g_shader_light[sh] = (unsigned char)light_cs_register(sh, joined);
+    if (sh < BS_MV_MAX_IDS) g_shader_ui[sh] = strstr(joined, "_ClipRect") && !strstr(joined, "gl_Position");
     static int cube_white = -1;
     if (cube_white < 0) {
         FILE *cf = fopen("sdmc:/switch/beat-saber-quest/cube_white", "r");
@@ -1152,6 +1234,11 @@ static void bs_glShaderSource(GLuint sh, GLsizei n, const GLchar *const *src, co
         total_divs += divs;
         if (divs && total_shaders++ < 4)
             debugPrintf("[gles] shader %u: %d instanced index division(s) -> shifts (total %d)\n", sh, divs, total_divs);
+        static int arr_logs;
+        int arrs = 0;
+        *fin = fix_instancing_arrays(*fin, &arrs);
+        if (arrs && arr_logs++ < 4)
+            debugPrintf("[gles] shader %u: %d instancing array(s) resized to fill 64 KiB\n", sh, arrs);
     }
     if (cube_white && strstr(*fin, "samplerCube _EnvironmentReflectionCube")) {
         /* Diagnostic: environment reflection sampled as white. */
@@ -1162,6 +1249,11 @@ static void bs_glShaderSource(GLuint sh, GLsizei n, const GLchar *const *src, co
             "highp vec4 bs_cubeWhite2(mediump samplerCube s, highp vec3 c) { return vec4(1.0); }\n"
             "void main()");
     }
+    if (sh < BS_MV_MAX_IDS)
+        /* Any Unity-instanced shader (notes, bombs, obstacles, ...): these
+         * index per-instance UBO arrays by instance ID + unity_BaseInstanceID
+         * and collapse on the emulated renderer when drawn as one batch. */
+        g_shader_note_body[sh] = strstr(joined, "unity_BaseInstanceID") != NULL;
     static int note_split = -1;
     if (note_split < 0) {
         FILE *nf = fopen("sdmc:/switch/beat-saber-quest/note_split", "r");
@@ -1215,12 +1307,18 @@ static void bs_glShaderSource(GLuint sh, GLsizei n, const GLchar *const *src, co
             "void main()");
     }
     static int id_viz = -1;
+    static char id_filter[64]; /* optional first line of the flag file: required substring */
     if (id_viz < 0) {
         FILE *idf = fopen("sdmc:/switch/beat-saber-quest/id_viz", "r");
         id_viz = idf != NULL;
-        if (idf) fclose(idf);
+        if (idf) {
+            if (fgets(id_filter, sizeof id_filter, idf))
+                id_filter[strcspn(id_filter, "\r\n")] = '\0';
+            fclose(idf);
+        }
     }
-    if (id_viz && strstr(*fin, "SV_Target0") && strstr(*fin, "    return;\n}") && !strstr(*fin, "gl_Position")) {
+    if (id_viz && (!id_filter[0] || strstr(*fin, id_filter)) &&
+        strstr(*fin, "SV_Target0") && strstr(*fin, "    return;\n}") && !strstr(*fin, "gl_Position")) {
         /* Diagnostic: right half = shader id, 3 bits per channel (R low). */
         char ins[200];
         snprintf(ins, sizeof ins,
@@ -1262,6 +1360,35 @@ static void bs_glShaderSource(GLuint sh, GLsizei n, const GLchar *const *src, co
         !strstr(*fin, "gl_Position")) {
         /* Diagnostic: every note-family fragment shader writes solid magenta. */
         *fin = str_replace_all(*fin, "    return;\n}", "    SV_Target0 = vec4(1.0, 0.0, 1.0, 1.0);\n    return;\n}");
+    }
+    static int mask_viz = -1;
+    if (mask_viz < 0) {
+        FILE *mvf = fopen("sdmc:/switch/beat-saber-quest/mask_viz", "r");
+        mask_viz = mvf != NULL;
+        if (mvf) fclose(mvf);
+    }
+    if (mask_viz && strstr(*fin, "texture(_MaskTex, vs_TEXCOORD1.xy).w") && strstr(*fin, "    return;\n}")) {
+        /* Diagnostic: UI mask shader -> R = mask alpha, G/B = mask UV. */
+        *fin = str_replace_all(*fin, "texture(_MaskTex, vs_TEXCOORD1.xy).w", "bs_maskTap(vs_TEXCOORD1.xy)");
+        *fin = str_replace_all(*fin, "void main()",
+            "highp float bs_maskVal;\n"
+            "highp float bs_maskTap(highp vec2 c) { bs_maskVal = texture(_MaskTex, c).w; return bs_maskVal; }\n"
+            "void main()");
+        *fin = str_replace_all(*fin, "    return;\n}",
+            "    SV_Target0 = vec4(bs_maskVal, fract(vs_TEXCOORD1.x), fract(vs_TEXCOORD1.y), 1.0);\n    return;\n}");
+        debugPrintf("[gles] mask_viz applied to shader %u\n", sh);
+    }
+    static int note_nodiscard = -1;
+    if (note_nodiscard < 0) {
+        FILE *ndf = fopen("sdmc:/switch/beat-saber-quest/note_nodiscard", "r");
+        note_nodiscard = ndf != NULL;
+        if (ndf) fclose(ndf);
+    }
+    if (note_nodiscard && strstr(*fin, "_Cutout") && strstr(*fin, "SV_Target0") &&
+        !strstr(*fin, "gl_Position")) {
+        /* Diagnostic: note-family cutout discard disabled; discarded pixels
+         * would have been drawn green instead. */
+        *fin = str_replace_all(*fin, "{discard;}", "{SV_Target0 = vec4(0.0, 1.0, 0.0, 1.0); return;}");
     }
     static int note_pos = -1;
     if (note_pos < 0) {
@@ -1732,7 +1859,124 @@ static void bs_glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
 /* Diagnostic (sdmc:/switch/beat-saber-quest/no_stencil): draw with the stencil
  * test off, to test whether stencil rejects notes/sabers. */
 static int g_no_stencil = -1, g_stencil_off, g_skip_opaque = -1;
+/* Diagnostic (trace_fs: fragment shader id): log the unit-0 texture and
+ * _ClipRect of draws using that fragment shader, once per texture. */
+static GLsizei g_trace_count;
+static GLenum g_trace_idx_type;
+static intptr_t g_trace_idx_off;
+static GLint g_trace_base;
+static void trace_fs_draw(void) {
+    static int want = -2, all_ui;
+    if (want == -2) {
+        want = -1;
+        FILE *f = fopen("sdmc:/switch/beat-saber-quest/trace_fs", "r");
+        if (f) {
+            char b[16] = {0};
+            if (fgets(b, sizeof b, f)) { if (!strncmp(b, "ui", 2)) all_ui = 1; else want = atoi(b); }
+            fclose(f);
+        }
+    }
+    if (t_program >= BS_MV_MAX_IDS) return;
+    if (all_ui ? !g_prog_ui[t_program] : (want < 0 || g_prog_fs_sh[t_program] != (unsigned)want)) return;
+    static unsigned seen[256];
+    static int nseen;
+    GLint active = 0, tex = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    unsigned key = (unsigned)tex << 12 | (t_program & 0xfff);
+    for (int i = 0; i < nseen; ++i) if (seen[i] == key) { glActiveTexture((GLenum)active); return; }
+    if (nseen >= 256) { glActiveTexture((GLenum)active); return; }
+    seen[nseen++] = key;
+    typedef void (*GetTexLevelFn)(GLenum, GLint, GLenum, GLint *);
+    static GetTexLevelFn get_level;
+    if (!get_level) get_level = (GetTexLevelFn)eglGetProcAddress("glGetTexLevelParameteriv");
+    GLint w = 0, h = 0, fmt = 0;
+    if (get_level && tex) {
+        get_level(GL_TEXTURE_2D, 0, 0x1000, &w);
+        get_level(GL_TEXTURE_2D, 0, 0x1001, &h);
+        get_level(GL_TEXTURE_2D, 0, 0x1003, &fmt);
+    }
+    glActiveTexture((GLenum)active);
+    float clip[4] = {0}, st[4] = {0}, col[4] = {0};
+    GLint loc = glGetUniformLocation(t_program, "_ClipRect");
+    if (loc >= 0) glGetUniformfv(t_program, loc, clip);
+    loc = glGetUniformLocation(t_program, "_MainTex_ST");
+    if (loc >= 0) glGetUniformfv(t_program, loc, st);
+    loc = glGetUniformLocation(t_program, "_Color");
+    if (loc >= 0) glGetUniformfv(t_program, loc, col);
+    /* Extent of attribute-0 positions referenced by this draw. */
+    float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+    GLint vbuf = 0, ibuf = 0, stride = 0, comps = 0, en = 0, vtype = 0;
+    void *voff = NULL;
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &vbuf);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &comps);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &vtype);
+    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &voff);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ibuf);
+    if (en && vbuf && vtype == GL_FLOAT && ibuf && g_trace_idx_type == GL_UNSIGNED_SHORT && g_trace_count > 0) {
+        GLint prev = 0, vsz = 0, isz = 0;
+        glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev);
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)vbuf);
+        glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &vsz);
+        glGetBufferParameteriv(GL_ELEMENT_ARRAY_BUFFER, GL_BUFFER_SIZE, &isz);
+        const unsigned char *vd = glMapBufferRange(GL_ARRAY_BUFFER, 0, vsz, GL_MAP_READ_BIT);
+        const unsigned char *id = vd ? glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER, 0, isz, GL_MAP_READ_BIT) : NULL;
+        if (vd && id) {
+            size_t st2 = stride ? (size_t)stride : (size_t)comps * 4, io = (size_t)voff;
+            for (GLsizei k = 0; k < g_trace_count; ++k) {
+                size_t ip = (size_t)g_trace_idx_off + (size_t)k * 2;
+                if (ip + 2 > (size_t)isz) break;
+                unsigned short ix;
+                memcpy(&ix, id + ip, 2);
+                size_t vp = io + ((size_t)ix + (size_t)g_trace_base) * st2;
+                if (vp + 12 > (size_t)vsz) continue;
+                float q[3];
+                memcpy(q, vd + vp, 12);
+                for (int c = 0; c < 3; ++c) { if (q[c] < mn[c]) mn[c] = q[c]; if (q[c] > mx[c]) mx[c] = q[c]; }
+            }
+            /* Per-quad dump (6 indices each): extent, colour, uv of first vertex. */
+            GLint cl = glGetAttribLocation(t_program, "in_COLOR0"), tl = glGetAttribLocation(t_program, "in_TEXCOORD0");
+            GLint coff = -1, toff = -1, ctype = 0;
+            if (cl >= 0) { void *o = NULL; glGetVertexAttribPointerv((GLuint)cl, GL_VERTEX_ATTRIB_ARRAY_POINTER, &o); coff = (GLint)(intptr_t)o;
+                           glGetVertexAttribiv((GLuint)cl, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ctype); }
+            if (tl >= 0) { void *o = NULL; glGetVertexAttribPointerv((GLuint)tl, GL_VERTEX_ATTRIB_ARRAY_POINTER, &o); toff = (GLint)(intptr_t)o; }
+            for (GLsizei k = 0; k + 6 <= g_trace_count && k < 6 * 40; k += 6) {
+                float qa[2] = {1e30f, 1e30f}, qb[2] = {-1e30f, -1e30f};
+                unsigned short ix0 = 0;
+                for (int j = 0; j < 6; ++j) {
+                    size_t ip = (size_t)g_trace_idx_off + (size_t)(k + j) * 2;
+                    if (ip + 2 > (size_t)isz) break;
+                    unsigned short ix; memcpy(&ix, id + ip, 2);
+                    if (!j) ix0 = ix;
+                    size_t vp = io + ((size_t)ix + (size_t)g_trace_base) * st2;
+                    if (vp + 8 > (size_t)vsz) continue;
+                    float q[2]; memcpy(q, vd + vp, 8);
+                    for (int c = 0; c < 2; ++c) { if (q[c] < qa[c]) qa[c] = q[c]; if (q[c] > qb[c]) qb[c] = q[c]; }
+                }
+                size_t vb = ((size_t)ix0 + (size_t)g_trace_base) * st2;
+                unsigned char col4[4] = {0}; float uv[2] = {0};
+                if (coff >= 0 && vb + (size_t)coff + 4 <= (size_t)vsz) memcpy(col4, vd + vb + coff, 4);
+                if (toff >= 0 && vb + (size_t)toff + 8 <= (size_t)vsz) memcpy(uv, vd + vb + toff, 8);
+                debugPrintf("[gles:fs]   q%d x=%.1f..%.1f y=%.1f..%.1f col=%02x%02x%02x%02x(t=0x%x) uv=%.3f,%.3f\n", (int)(k / 6),
+                            qa[0], qb[0], qa[1], qb[1], col4[0], col4[1], col4[2], col4[3], ctype, uv[0], uv[1]);
+            }
+        }
+        if (id) glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
+        if (vd) glUnmapBuffer(GL_ARRAY_BUFFER);
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prev);
+    }
+    debugPrintf("[gles:fs] fs=%u prog=%u tex=%d %dx%d fmt=0x%x n=%d pos=(%.1f..%.1f, %.1f..%.1f, %.1f..%.1f) "
+                "clip=(%.1f %.1f %.1f %.1f) st=(%.2f %.2f %.2f %.2f) "
+                "col=(%.2f %.2f %.2f %.2f) fbo=%u\n", g_prog_fs_sh[t_program], t_program, tex, w, h, fmt,
+                (int)g_trace_count, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2],
+                clip[0], clip[1], clip[2], clip[3], st[0], st[1], st[2], st[3],
+                col[0], col[1], col[2], col[3], t_draw_fbo);
+}
 static int pre_draw(void) {
+    trace_fs_draw();
     if (g_no_stencil < 0) {
         FILE *f = fopen("sdmc:/switch/beat-saber-quest/no_stencil", "r");
         g_no_stencil = f != NULL;
@@ -1748,42 +1992,110 @@ static int pre_draw(void) {
         glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
         if (dm && glIsEnabled(GL_DEPTH_TEST) && mv_active()) return 1;
     }
+    if (glIsEnabled(GL_STENCIL_TEST)) {
+        /* Log each distinct stencil state once (UI Mask diagnosis). */
+        static unsigned keys[32];
+        static int nkeys;
+        GLint sf = 0, sr = 0, sw = 0, op = 0;
+        glGetIntegerv(GL_STENCIL_FUNC, &sf);
+        glGetIntegerv(GL_STENCIL_REF, &sr);
+        glGetIntegerv(GL_STENCIL_WRITEMASK, &sw);
+        glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &op);
+        unsigned key = ((unsigned)sf & 0xf) | ((unsigned)sr & 0xff) << 4 | ((unsigned)sw & 0xff) << 12 |
+                       ((unsigned)op & 0xfff) << 20;
+        int seen = 0;
+        for (int k = 0; k < nkeys; ++k) seen |= keys[k] == key;
+        if (!seen && nkeys < 32) {
+            keys[nkeys++] = key;
+            GLboolean cm[4] = {0};
+            glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+            debugPrintf("[gles:stencil] func=0x%x ref=%d wmask=0x%x zpass=0x%x cmask=%d%d%d%d fbo=%u prog=%u mv=%d\n",
+                        sf, sr, sw, op, cm[0], cm[1], cm[2], cm[3], t_draw_fbo, t_program, mv_active());
+        }
+    }
     if (g_no_stencil && glIsEnabled(GL_STENCIL_TEST)) { glDisable(GL_STENCIL_TEST); g_stencil_off = 1; }
     return 0;
 }
 static void post_draw(void) {
     if (g_stencil_off) { glEnable(GL_STENCIL_TEST); g_stencil_off = 0; }
 }
-#define DRAW_COUNT() do { if (pre_draw()) return; ++bs_gl_draws; ++g_frame_draws; if (!t_draw_fbo) ++g_fb0_draws; } while (0)
+#define TRACE_ARGS(c_, t_, i_, b_) (g_trace_count = (c_), g_trace_idx_type = (t_), g_trace_idx_off = (intptr_t)(i_), g_trace_base = (b_))
+#define DRAW_COUNT() do { \
+    if (pre_draw()) return; \
+    ++bs_gl_draws; \
+    ++g_frame_draws; \
+    if (!t_draw_fbo) ++g_fb0_draws; \
+    if (mv_active()) ++g_mv_draws; \
+} while (0)
 static void bs_glDrawArrays(GLenum m, GLint f, GLsizei c) {
+    TRACE_ARGS(c, 0, 0, 0);
     DRAW_COUNT();
-    if (mv_active()) { ++g_mv_draws; glDrawArraysInstanced(m, f, c, 2); }
-    else { glDrawArrays(m, f, c); if (t_draw_fbo) trace_target_max("after drawArrays"); }
+    glDrawArrays(m, f, c);
+    if (t_draw_fbo) trace_target_max("after drawArrays");
     trace_after("drawArrays", m, c, 1);
 }
 static void bs_glDrawElements(GLenum m, GLsizei c, GLenum t, const void *i) {
+    TRACE_ARGS(c, t, i, 0);
     DRAW_COUNT();
-    if (mv_active()) { ++g_mv_draws; glDrawElementsInstanced(m, c, t, i, 2); }
-    else { glDrawElements(m, c, t, i); if (t_draw_fbo) trace_target_max("after drawElements"); }
+    glDrawElements(m, c, t, i);
+    if (t_draw_fbo) trace_target_max("after drawElements");
     trace_after("drawElements", m, c, 1);
 }
 static void bs_glDrawRangeElements(GLenum m, GLuint s, GLuint e, GLsizei c, GLenum t,
                                    const void *i) {
+    TRACE_ARGS(c, t, i, 0);
     DRAW_COUNT();
-    if (mv_active()) { ++g_mv_draws; glDrawElementsInstanced(m, c, t, i, 2); }
-    else glDrawRangeElements(m, s, e, c, t, i);
+    glDrawRangeElements(m, s, e, c, t, i);
     trace_after("drawRangeElements", m, c, 1);
+}
+static void inst_log(GLsizei n) {
+    static GLsizei max_n;
+    static int logs;
+    if (n > max_n && logs < 12) {
+        max_n = n; ++logs;
+        debugPrintf("[gles] instanced draw: new max instance count %d (prog %u)\n", (int)n, t_program);
+    }
+}
+/* Instanced batches (notes, bombs, walls) on the emulated renderer only
+ * produce the first instance correctly. Submit each instance separately with
+ * its original index into Unity's instancing UBOs. Programs without
+ * unity_BaseInstanceID get loc -1 and draw normally. */
+static GLint note_batch_base(GLsizei instances, GLint *base) {
+    if (instances <= 1 || t_program >= BS_MV_MAX_IDS ||
+        !g_prog_note_body[t_program] || !mv_active())
+        return -1;
+    GLint loc = glGetUniformLocation(t_program, "unity_BaseInstanceID");
+    if (loc >= 0) {
+        glGetUniformiv(t_program, loc, base);
+        static int logged;
+        if (logged++ < 4)
+            debugPrintf("[gles:notes] splitting program %u draw with %d instances, base=%d\n",
+                        t_program, instances, *base);
+    }
+    return loc;
 }
 static void bs_glDrawElementsInstanced(GLenum m, GLsizei c, GLenum t,
                                        const void *i, GLsizei n) {
+    TRACE_ARGS(c, t, i, 0);
     DRAW_COUNT();
-    if (mv_active()) { ++g_mv_draws; n *= 2; }
-    glDrawElementsInstanced(m, c, t, i, n);
+    inst_log(n);
+    GLint base = 0;
+    GLint loc = note_batch_base(n, &base);
+    if (loc < 0) {
+        glDrawElementsInstanced(m, c, t, i, n);
+    } else {
+        for (GLsizei note = 0; note < n; ++note) {
+            glUniform1i(loc, base + note);
+            glDrawElementsInstanced(m, c, t, i, 1);
+        }
+        glUniform1i(loc, base);
+    }
     trace_after("drawElementsInst", m, c, n);
 }
 static void bs_glDrawArraysInstanced(GLenum m, GLint f, GLsizei c, GLsizei n) {
+    TRACE_ARGS(c, 0, 0, 0);
     DRAW_COUNT();
-    if (mv_active()) { ++g_mv_draws; n *= 2; }
+    inst_log(n);
     glDrawArraysInstanced(m, f, c, n);
     trace_after("drawArraysInst", m, c, n);
 }
@@ -1803,23 +2115,34 @@ static void load_base_vertex(void) {
     }
 }
 static void bs_glDrawElementsBaseVertex(GLenum m, GLsizei c, GLenum t, const void *i, GLint b) {
+    TRACE_ARGS(c, t, i, b);
     DRAW_COUNT(); load_base_vertex();
-    if (mv_active()) { ++g_mv_draws; g_dibv(m, c, t, i, 2, b); }
-    else g_dbv(m, c, t, i, b);
+    g_dbv(m, c, t, i, b);
     trace_after("drawElementsBV", m, c, 1);
 }
 static void bs_glDrawElementsInstancedBaseVertex(GLenum m, GLsizei c, GLenum t,
                                                  const void *i, GLsizei n, GLint b) {
+    TRACE_ARGS(c, t, i, b);
     DRAW_COUNT(); load_base_vertex();
-    if (mv_active()) { ++g_mv_draws; n *= 2; }
-    g_dibv(m, c, t, i, n, b);
+    inst_log(n);
+    GLint base = 0;
+    GLint loc = note_batch_base(n, &base);
+    if (loc < 0) {
+        g_dibv(m, c, t, i, n, b);
+    } else {
+        for (GLsizei note = 0; note < n; ++note) {
+            glUniform1i(loc, base + note);
+            g_dibv(m, c, t, i, 1, b);
+        }
+        glUniform1i(loc, base);
+    }
     trace_after("drawElementsInstBV", m, c, n);
 }
 static void bs_glDrawRangeElementsBaseVertex(GLenum m, GLuint s, GLuint e, GLsizei c,
                                              GLenum t, const void *i, GLint b) {
+    TRACE_ARGS(c, t, i, b);
     DRAW_COUNT(); load_base_vertex();
-    if (mv_active()) { ++g_mv_draws; g_dibv(m, c, t, i, 2, b); }
-    else g_drbv(m, s, e, c, t, i, b);
+    g_drbv(m, s, e, c, t, i, b);
     trace_after("drawRangeElementsBV", m, c, 1);
 }
 static void bs_glVertexAttribDivisor(GLuint index, GLuint divisor) {
@@ -1874,14 +2197,23 @@ static void bs_glLinkProgram(GLuint p) {
 static void bs_glAttachShader(GLuint p, GLuint s) {
     if (p < BS_MV_MAX_IDS && s < BS_MV_MAX_IDS) {
         if (g_shader_light[s]) g_prog_light[p] = g_shader_light[s];
+        if (g_shader_ui[s]) g_prog_ui[p] = 1;
         if (g_shader_mv[s]) { g_prog_mv[p] = g_shader_mv[s]; g_prog_vs[p] = g_shader_seq[s]; g_prog_cut[p] = g_shader_cut[s]; }
-        else g_prog_fs[p] = g_shader_seq[s];
+        else {
+            g_prog_fs[p] = g_shader_seq[s];
+            g_prog_fs_sh[p] = (unsigned short)s;
+        }
+        if (g_shader_note_body[s]) g_prog_note_body[p] = 1;
     }
     glAttachShader(p, s);
 }
 static GLuint bs_glCreateProgram(void) {
     GLuint p = glCreateProgram();
-    if (p < BS_MV_MAX_IDS) { g_prog_mv[p] = BS_PROG_UNKNOWN; g_prog_light[p] = 0; }
+    if (p < BS_MV_MAX_IDS) {
+        g_prog_mv[p] = BS_PROG_UNKNOWN;
+        g_prog_light[p] = 0;
+        g_prog_note_body[p] = 0;
+    }
     return p;
 }
 static void bs_glFlush(void) { ++bs_gl_flushes; glFlush(); }
@@ -1944,6 +2276,15 @@ static void swz_identity(GLenum t) {
     glTexParameteri(t, 0x8E44, GL_BLUE);
     glTexParameteri(t, 0x8E45, GL_ALPHA);
 }
+static void swz_log(const char *what, GLenum t, GLenum f, GLsizei w, GLsizei h) {
+    GLint tex = bound_tex2d(t);
+    if (tex <= 0 || tex >= BS_TEX_FMT_MAX || !g_tex_swz_set[tex]) return;
+    const GLint *z = g_tex_swz[tex];
+    static int n;
+    if (n++ < 40)
+        debugPrintf("[gles:swz] %s tex=%d target=0x%x fmt=0x%x %dx%d swz=0x%x,0x%x,0x%x,0x%x set=0x%x\n",
+                    what, tex, t, f, w, h, z[0], z[1], z[2], z[3], g_tex_swz_set[tex]);
+}
 static void bs_glTexStorage2D(GLenum t, GLsizei lv, GLenum f, GLsizei w, GLsizei h) {
     GLint tex = bound_tex2d(t);
     int ok = tex > 0 && tex < BS_TEX_FMT_MAX;
@@ -1958,20 +2299,34 @@ static void bs_glTexStorage2D(GLenum t, GLsizei lv, GLenum f, GLsizei w, GLsizei
         tex_log("TexStorage2D", t, 0, GL_RGBA8, lv, w, h, 1, 0);
         return;
     }
+    swz_log("TexStorage2D", t, f, w, h);
     glTexStorage2D(t, lv, f, w, h);
     tex_log("TexStorage2D", t, 0, f, lv, w, h, 1, 0);
 }
 static void swz_record(GLenum t, GLenum p, GLint v) {
-    if (t != GL_TEXTURE_2D) return;
+    if (t != GL_TEXTURE_2D && t != GL_TEXTURE_3D) return;
     GLint tex = bound_tex2d(t);
     if (tex > 0 && tex < BS_TEX_FMT_MAX) {
         GLuint channel = p - 0x8E42;
         g_tex_swz[tex][channel] = v;
         g_tex_swz_set[tex] |= 1u << channel;
+        if (channel == 3 && v != GL_ALPHA && !g_tex_a8[tex]) {
+            GLint fmt = 0, w = 0;
+            typedef void (*GetTexLevelFn)(GLenum, GLint, GLenum, GLint *);
+            static GetTexLevelFn get_level;
+            if (!get_level) get_level = (GetTexLevelFn)eglGetProcAddress("glGetTexLevelParameteriv");
+            if (get_level) {
+                get_level(t, 0, 0x1003 /* INTERNAL_FORMAT */, &fmt);
+                get_level(t, 0, 0x1000 /* WIDTH */, &w);
+            }
+            static int n;
+            if (n++ < 40)
+                debugPrintf("[gles:swz] set A=0x%x tex=%d fmt=0x%x w=%d (r=0x%x)\n", v, tex, fmt, w, g_tex_swz[tex][0]);
+        }
     }
 }
 static int swz_tex_converted(GLenum t) {
-    GLint tex = t == GL_TEXTURE_2D ? bound_tex2d(t) : 0;
+    GLint tex = t == GL_TEXTURE_2D || t == GL_TEXTURE_3D ? bound_tex2d(t) : 0;
     return tex > 0 && tex < BS_TEX_FMT_MAX && g_tex_a8[tex];
 }
 static void bs_glTexParameteri(GLenum t, GLenum p, GLint v) {
@@ -1991,12 +2346,16 @@ static void bs_glTexParameteriv(GLenum t, GLenum p, const GLint *v) {
     }
     glTexParameteriv(t, p, v);
 }
-/* GL_RED/UNSIGNED_BYTE rows -> RGBA (0,0,0,a), honouring unpack state. */
-static int a8_upload(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h,
-                     GLenum f, GLenum ty, const void *p) {
+/* GL_RED/UNSIGNED_BYTE texels -> RGBA (0,0,0,a), honouring unpack state.
+ * d > 0 selects a 3D upload at slice z. */
+static int a8_upload3(GLenum t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h,
+                      GLsizei d, GLenum f, GLenum ty, const void *p) {
     if (!swz_tex_converted(t) || f != GL_RED || ty != GL_UNSIGNED_BYTE || w <= 0 || h <= 0)
         return 0;
-    GLint pbo = 0, align = 4, row_len = 0, skip_px = 0, skip_rows = 0;
+    int is3d = t == GL_TEXTURE_3D;
+    if (is3d && d <= 0) return 0;
+    GLsizei depth = is3d ? d : 1;
+    GLint pbo = 0, align = 4, row_len = 0, skip_px = 0, skip_rows = 0, img_h = 0, skip_img = 0;
     glGetIntegerv(0x88EF /* PIXEL_UNPACK_BUFFER_BINDING */, &pbo);
     if (pbo || !p) {
         static int n;
@@ -2007,33 +2366,68 @@ static int a8_upload(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h,
     glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_len);
     glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_px);
     glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    if (is3d) {
+        glGetIntegerv(0x806E /* UNPACK_IMAGE_HEIGHT */, &img_h);
+        glGetIntegerv(0x806D /* UNPACK_SKIP_IMAGES */, &skip_img);
+    }
     size_t rl = (size_t)(row_len > 0 ? row_len : w);
     size_t a = align > 0 ? (size_t)align : 1;
     size_t stride = (rl + a - 1) / a * a;
-    unsigned char *rgba = malloc((size_t)w * (size_t)h * 4);
+    size_t slice = stride * (size_t)(img_h > 0 ? img_h : h);
+    unsigned char *rgba = malloc((size_t)w * (size_t)h * (size_t)depth * 4);
     if (!rgba) return 0;
-    const unsigned char *src = (const unsigned char *)p + (size_t)skip_rows * stride + (size_t)skip_px;
-    for (GLsizei r = 0; r < h; ++r) {
-        const unsigned char *s = src + (size_t)r * stride;
-        unsigned char *d = rgba + (size_t)r * (size_t)w * 4;
-        for (GLsizei c = 0; c < w; ++c) {
-            d[c * 4 + 0] = 0; d[c * 4 + 1] = 0; d[c * 4 + 2] = 0; d[c * 4 + 3] = s[c];
+    const unsigned char *src = (const unsigned char *)p + (size_t)skip_img * slice +
+                               (size_t)skip_rows * stride + (size_t)skip_px;
+    for (GLsizei k = 0; k < depth; ++k)
+        for (GLsizei r = 0; r < h; ++r) {
+            const unsigned char *s = src + (size_t)k * slice + (size_t)r * stride;
+            unsigned char *o = rgba + (((size_t)k * (size_t)h + (size_t)r) * (size_t)w) * 4;
+            for (GLsizei c = 0; c < w; ++c) {
+                o[c * 4 + 0] = 0; o[c * 4 + 1] = 0; o[c * 4 + 2] = 0; o[c * 4 + 3] = s[c];
+            }
         }
-    }
-    GLint saved_align = align;
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
     glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-    glTexSubImage2D(t, l, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, saved_align);
+    if (is3d) {
+        glPixelStorei(0x806E, 0);
+        glPixelStorei(0x806D, 0);
+        glTexSubImage3D(t, l, x, y, z, w, h, d, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glPixelStorei(0x806E, img_h);
+        glPixelStorei(0x806D, skip_img);
+    } else {
+        glTexSubImage2D(t, l, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, align);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, row_len);
     glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_px);
     glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
     free(rgba);
     return 1;
 }
+static int a8_upload(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h,
+                     GLenum f, GLenum ty, const void *p) {
+    return a8_upload3(t, l, x, y, 0, w, h, 0, f, ty, p);
+}
 static void bs_glTexStorage3D(GLenum t, GLsizei lv, GLenum f, GLsizei w, GLsizei h, GLsizei d) {
+    /* Only GL_TEXTURE_3D: bound_tex2d() falls back to the 2D binding for
+     * other targets (cube arrays), which must not clear a 2D texture's state. */
+    GLint tex = t == GL_TEXTURE_3D ? bound_tex2d(t) : 0;
+    int ok = tex > 0 && tex < BS_TEX_FMT_MAX;
+    if (ok) g_tex_a8[tex] = 0;
+    if (ok && f == GL_R8 && swz_is_alpha8(tex)) {
+        /* Same swizzle loss as 2D Alpha8: the note dissolve noise
+         * (_CutoutTex) is a 3D Alpha8 texture. */
+        glTexStorage3D(t, lv, GL_RGBA8, w, h, d);
+        swz_identity(t);
+        g_tex_a8[tex] = 1;
+        static int n;
+        if (n++ < 8)
+            debugPrintf("[gles:tex] Alpha8 3D tex=%d %dx%dx%d levels=%d -> RGBA8 (0,0,0,a)\n", tex, w, h, d, lv);
+        tex_log("TexStorage3D", t, 0, GL_RGBA8, lv, w, h, d, 0);
+        return;
+    }
     glTexStorage3D(t, lv, f, w, h, d);
     tex_log("TexStorage3D", t, 0, f, lv, w, h, d, 0);
 }
@@ -2051,6 +2445,7 @@ static void bs_glTexImage2D(GLenum t, GLint l, GLint inf, GLsizei w, GLsizei h, 
             return;
         }
     }
+    if (l == 0) swz_log("TexImage2D", t, (GLenum)inf, w, h);
     glTexImage2D(t, l, inf, w, h, b, f, ty, p);
     tex_log("TexImage2D", t, l, (GLenum)inf, ty, w, h, 1, 0);
 }
@@ -2062,6 +2457,7 @@ static void bs_glTexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei w, G
 }
 static void bs_glCompressedTexImage2D(GLenum t, GLint l, GLenum f, GLsizei w, GLsizei h, GLint b,
                                       GLsizei sz, const void *p) {
+    if (l == 0) swz_log("CompressedTexImage2D", t, f, w, h);
     glCompressedTexImage2D(t, l, f, w, h, b, sz, p);
     tex_log("CompressedTexImage2D", t, l, f, 0, w, h, 1, sz);
 }
@@ -2072,7 +2468,8 @@ static void bs_glCompressedTexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GL
 }
 static void bs_glTexSubImage3D(GLenum t, GLint l, GLint x, GLint y, GLint z, GLsizei w, GLsizei h,
                                GLsizei d, GLenum f, GLenum ty, const void *p) {
-    glTexSubImage3D(t, l, x, y, z, w, h, d, f, ty, p);
+    if (!a8_upload3(t, l, x, y, z, w, h, d, f, ty, p))
+        glTexSubImage3D(t, l, x, y, z, w, h, d, f, ty, p);
     tex_log("TexSubImage3D", t, l, f, ty, w, h, d, 0);
 }
 static void bs_glCompressedTexSubImage3D(GLenum t, GLint l, GLint x, GLint y, GLint z, GLsizei w,

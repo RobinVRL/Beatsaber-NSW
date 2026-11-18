@@ -31,6 +31,10 @@ struct BsChoreographer {
     void *looper;
     ViDisplay display;
     Event vsync;
+    /* false: VI vsync was refused (seen on hardware, 0x1272) and callbacks
+     * are paced by a 60 Hz system-tick timer instead. */
+    bool has_vsync;
+    u64 next_tick;
     unsigned pending_count;
     BsChoreographerEntry pending[BS_CHOREOGRAPHER_MAX_CALLBACKS];
 };
@@ -79,16 +83,19 @@ BsChoreographer *bs_choreographer_get_instance(void) {
             }
             if (R_FAILED(rc)) viExit();
         }
-        if (R_FAILED(rc)) {
-            debugPrintf("[choreographer] Horizon VI vsync unavailable (0x%x)\n", rc);
-            entry = NULL;
-        } else {
-            entry->owner = owner;
-            entry->looper = looper;
-            entry->initialized = true;
+        /* Without frame callbacks Unity never renders, so a missing VI vsync
+         * falls back to timer pacing instead of refusing the Choreographer. */
+        entry->has_vsync = R_SUCCEEDED(rc);
+        entry->next_tick = 0;
+        entry->owner = owner;
+        entry->looper = looper;
+        entry->initialized = true;
+        if (entry->has_vsync)
             debugPrintf("[choreographer] instance for tid=%lu (VI vsync)\n",
                         (unsigned long)owner);
-        }
+        else
+            debugPrintf("[choreographer] Horizon VI vsync unavailable (0x%x); "
+                        "instance for tid=%lu uses 60 Hz timer\n", rc, (unsigned long)owner);
     }
     mutexUnlock(&g_choreographer_lock);
     return entry;
@@ -104,9 +111,11 @@ void bs_choreographer_release_looper(uint64_t owner) {
          * and VI event handles are returned to Horizon without leaking them. */
         current->initialized = false;
         current->pending_count = 0;
-        eventClose(&current->vsync);
-        viCloseDisplay(&current->display);
-        viExit();
+        if (current->has_vsync) {
+            eventClose(&current->vsync);
+            viCloseDisplay(&current->display);
+            viExit();
+        }
         memset(current, 0, sizeof(*current));
         break;
     }
@@ -139,7 +148,7 @@ static void bs_choreographer_post(BsChoreographer *choreographer,
         /* The VI event is a remote readable event: libnx clears it with
          * svcResetSignal, which reports InvalidState when it is simply not
          * signalled. That is the expected state, not an error. */
-        if (choreographer->pending_count == 0)
+        if (choreographer->pending_count == 0 && choreographer->has_vsync)
             (void)eventClear(&choreographer->vsync);
         BsChoreographerEntry *entry =
             &choreographer->pending[choreographer->pending_count++];
@@ -195,14 +204,29 @@ int bs_choreographer_dispatch_current(void) {
      * holding either the VI lock or the ALooper's pipe/condition lock. */
     mutexLock(&g_choreographer_lock);
     BsChoreographer *choreographer = bs_choreographer_current_locked(owner);
-    if (!choreographer || !choreographer->pending_count ||
-        R_FAILED(eventWait(&choreographer->vsync, 0))) {
+    if (!choreographer || !choreographer->pending_count) {
         mutexUnlock(&g_choreographer_lock);
         return 0;
     }
+    if (choreographer->has_vsync) {
+        if (R_FAILED(eventWait(&choreographer->vsync, 0))) {
+            mutexUnlock(&g_choreographer_lock);
+            return 0;
+        }
+        /* Not autoclear: consume this vsync so the next one is waited for. */
+        (void)eventClear(&choreographer->vsync);
+    } else {
+        const u64 period = armNsToTicks(16666667ull);
+        u64 now_tick = armGetSystemTick();
+        if (now_tick < choreographer->next_tick) {
+            mutexUnlock(&g_choreographer_lock);
+            return 0;
+        }
+        /* Keep a steady cadence, but never try to catch up missed frames. */
+        choreographer->next_tick = choreographer->next_tick + period > now_tick
+            ? choreographer->next_tick + period : now_tick + period;
+    }
     BsChoreographerEntry callbacks[BS_CHOREOGRAPHER_MAX_CALLBACKS];
-    /* Not autoclear: consume this vsync so the next one is waited for. */
-    (void)eventClear(&choreographer->vsync);
     unsigned count = choreographer->pending_count;
     memcpy(callbacks, choreographer->pending, count * sizeof(callbacks[0]));
     choreographer->pending_count = 0;

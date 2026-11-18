@@ -96,5 +96,7 @@ int so_patch_code(void *dst, const void *src, size_t len);
  * arena so the mmap window avoids it and bounces file I/O on its data pages.
  * Always false on Switch 1. */
 bool so_arena_range(uintptr_t *start, uintptr_t *end);
+/* Switch 2: stack-region window reserved alongside the module arena. */
+bool so_window_reservation(uintptr_t *base, size_t *size, void **rv);
 
 #endif

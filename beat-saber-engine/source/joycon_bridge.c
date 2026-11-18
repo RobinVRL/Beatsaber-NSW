@@ -12,12 +12,15 @@
 
 #ifndef BS_JOYCON_HOST_TEST
 #include <switch.h>
+#include "util.h"
+#define JCLOG(...) debugPrintf("[joycon] " __VA_ARGS__)
 static Mutex g_joycon_mutex;
 static void joycon_lock(void) { mutexLock(&g_joycon_mutex); }
 static void joycon_unlock(void) { mutexUnlock(&g_joycon_mutex); }
 #else
 static void joycon_lock(void) {}
 static void joycon_unlock(void) {}
+#define JCLOG(...) ((void)0)
 #endif
 
 /* These constants are the ABI bits of HidNpadStyleTag, HidNpadAttribute and
@@ -151,7 +154,10 @@ static size_t backend_read_frames(BsRawFrame *frames, size_t cap) {
 
 static void backend_stop_motion(unsigned hand) {
     BsImuHandle *imu = &g_imus[hand];
-    if (imu->started) (void)hidStopSixAxisSensor(imu->handle);
+    if (imu->started) {
+        JCLOG("hand %u motion stopped (npad %u style %#x)\n", hand, imu->id, imu->style);
+        (void)hidStopSixAxisSensor(imu->handle);
+    }
     memset(imu, 0, sizeof(*imu));
 }
 
@@ -168,19 +174,30 @@ static int backend_read_motion(const BsRawFrame *frame, unsigned hand,
         Result rc = hidGetSixAxisSensorHandles(handles, count,
                           (HidNpadIdType)frame->id, (HidNpadStyleTag)frame->style);
         HidSixAxisSensorHandle handle = handles[frame->style == BS_STYLE_DUAL ? hand : 0];
+        Result handles_rc = rc;
         if (R_SUCCEEDED(rc)) rc = hidStartSixAxisSensor(handle);
+        static int fail_logs;
         if (R_FAILED(rc)) {
+            if (fail_logs++ < 24)
+                JCLOG("hand %u motion start FAILED npad %u style %#x handles_rc=%#x start_rc=%#x\n",
+                      hand, frame->id, frame->style, handles_rc, rc);
             imu->retry_after_ns = now ? now + BS_GYRO_START_RETRY_NS : 0;
             return 0;
         }
+        JCLOG("hand %u motion started npad %u style %#x handle=%#x\n",
+              hand, frame->id, frame->style, handle.type_value);
         imu->handle = handle;
         imu->id = frame->id;
         imu->style = frame->style;
         imu->started = 1;
     }
     HidSixAxisSensorState state = {0};
-    if (hidGetSixAxisSensorStates(imu->handle, &state, 1) != 1 ||
-        !(state.attributes & HidSixAxisSensorAttribute_IsConnected)) {
+    size_t got = hidGetSixAxisSensorStates(imu->handle, &state, 1);
+    if (got != 1 || !(state.attributes & HidSixAxisSensorAttribute_IsConnected)) {
+        static int lost_logs;
+        if (lost_logs++ < 24)
+            JCLOG("hand %u motion lost: states=%zu attributes=%#x\n",
+                  hand, got, (unsigned)state.attributes);
         backend_stop_motion(hand);
         imu->retry_after_ns = now ? now + BS_GYRO_START_RETRY_NS : 0;
         return 0;
@@ -439,6 +456,21 @@ int bs_joycon_poll(BsJoyconSnapshot *out) {
             prev->capabilities != curr->capabilities) {
             ++next.generation;
             break;
+        }
+    }
+    if (next.generation != g_snapshot.generation) {
+        static int change_logs;
+        if (change_logs++ < 48) {
+            JCLOG("change #%llu: %zu npad frame(s)\n",
+                  (unsigned long long)next.generation, count);
+            for (size_t i = 0; i < count; ++i)
+                JCLOG("  frame npad %u style %#x attributes %#x\n",
+                      frames[i].id, frames[i].style, frames[i].attributes);
+            for (unsigned hand = 0; hand < BS_JOYCON_HAND_COUNT; ++hand)
+                JCLOG("  hand %u connected=%u npad %u style %#x caps %#x\n", hand,
+                      (unsigned)next.hands[hand].connected, (unsigned)next.hands[hand].npad_id,
+                      (unsigned)next.hands[hand].npad_style,
+                      (unsigned)next.hands[hand].capabilities);
         }
     }
     g_snapshot = next;

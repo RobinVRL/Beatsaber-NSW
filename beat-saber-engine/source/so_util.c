@@ -227,6 +227,8 @@ static struct {
   u64 start, end, next;
   bool tried;
 } g_arena;
+static VirtmemReservation *g_window_rv;
+static u64 g_window_base, g_window_size;
 
 bool so_arena_range(uintptr_t *start, uintptr_t *end) {
   if (!g_arena.start) return false;
@@ -271,7 +273,35 @@ static bool so_arena_init_locked(void) {
   debugPrintf("[link] module arena %p+%llu MiB in stack region %p+%llu MiB\n",
               (void *)start, (unsigned long long)(size >> 20), (void *)region,
               (unsigned long long)(length >> 20));
+  /* Claim the rest of this free block for the mmap overcommit window NOW.
+   * Otherwise thread stacks (placed at random free stack-region addresses)
+   * land in it before Unity's first reserve and split it below 512 MiB,
+   * which on hardware made every large reserve fail (ENOMEM crash). */
+  {
+    const u64 align = 256ull << 20, headroom = 64ull << 20;
+    u64 lo = (g_arena.end + SO_ARENA_GUARD + align - 1) & ~(align - 1);
+    u64 hi = best + best_size;
+    if (hi > lo + headroom) hi -= headroom;
+    if (hi > lo && hi - lo >= (512ull << 20)) {
+      u64 wsize = (hi - lo) & ~(align - 1);
+      VirtmemReservation *rv = virtmemAddReservation((void *)lo, wsize);
+      if (rv) {
+        g_window_rv = rv; g_window_base = lo; g_window_size = wsize;
+        debugPrintf("[link] mmap window pre-reserved %p+%llu MiB\n",
+                    (void *)lo, (unsigned long long)(wsize >> 20));
+      }
+    }
+  }
   return true;
+}
+
+bool so_window_reservation(uintptr_t *base, size_t *size, void **rv) {
+  virtmemLock();
+  so_arena_init_locked();
+  bool ok = g_window_rv != NULL;
+  if (ok) { *base = (uintptr_t)g_window_base; *size = (size_t)g_window_size; *rv = g_window_rv; }
+  virtmemUnlock();
+  return ok;
 }
 
 static void *so_arena_alloc(size_t size) {
@@ -355,6 +385,10 @@ uint32_t so_finalize(so_module *mod) {
   return 0;
 }
 #else
+bool so_window_reservation(uintptr_t *base, size_t *size, void **rv) {
+  (void)base; (void)size; (void)rv;
+  return false;
+}
 bool so_arena_range(uintptr_t *start, uintptr_t *end) {
   (void)start; (void)end;
   return false;

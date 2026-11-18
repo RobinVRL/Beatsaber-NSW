@@ -1,0 +1,41 @@
+# Game files: never commit
+SwitchPort/*
+!SwitchPort/README.md
+import/
+private-sd/
+*.apk
+*.obb
+*.so
+*.bundle
+
+# Build output
+build/
+*.d
+*.a
+*.pdb
+*.obj
+*.nro
+*.elf
+*.nacp
+*.map
+*.o
+*.exe
+*.lst
+
+# Optional prebuilt NVK SDK
+beat-saber-engine/nvk-sdk/
+
+# Reports, dumps and logs
+abi-report.json
+latest_unresolved_imports.txt
+quest-analysis/*.json
+quest-analysis/*.txt
+shaderdump/
+*.log
+*.png
+
+# Tooling
+__pycache__/
+*.pyc
+.vscode/
+.idea/

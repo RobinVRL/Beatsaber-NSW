@@ -40,3 +40,6 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+
+# setup.ps1 output (contains your game files)
+SD/

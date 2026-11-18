@@ -28,7 +28,24 @@ This port is coded with AI assistance.
 Remaining visual and functional issues are tracked in
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
-## Quick start
+## Easy setup (no build tools needed)
+
+1. Download [`setup.ps1`](setup.ps1) and [`setup.bat`](setup.bat) into an
+   empty folder.
+2. Copy your own Beat Saber Quest **1.46.0_34060** APK (any file name) and
+   `main.3491.com.beatgames.beatsaber.obb` into the same folder.
+3. Double-click `setup.bat` and choose Switch, Switch 2 or both.
+
+The script checks the files, extracts them into `SD\switch\beat-saber-quest\`
+and downloads the matching NRO from the latest release. Copy the `SD\switch`
+folder to the root of your SD card. Then launch `Beatsaber.nro` (Switch) or
+`BeatsaberNS2.nro` (Switch 2) in **full-memory title-override mode**.
+
+Options: `-Destination E:\` writes straight to the SD card, `-Console Switch2`
+skips the question, and `-NroPath .\my.nro` uses a local build instead of
+downloading one.
+
+## Building from source
 
 Requirements:
 

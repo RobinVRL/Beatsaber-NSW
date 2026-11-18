@@ -28,7 +28,6 @@
 
 ## Platform
 
-- Tested only in the Eden emulator so far. Real Switch hardware is untested.
 - The loader must be launched in full-memory title mode. Applet mode doesn't
   have enough memory or code-mapping rights.
 - Multiplayer, leaderboards, store/DLC purchases and other online features

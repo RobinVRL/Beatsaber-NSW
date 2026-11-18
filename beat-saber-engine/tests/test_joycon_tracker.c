@@ -76,7 +76,100 @@ static void test_rejects_garbage(void) {
     for (int i = 0; i < 3; ++i) assert(isfinite(p[i]));
 }
 
+/* Pitch rotation about +X (XR), as xyzw. */
+static void pitch_q(float a, float q[4]) {
+    q[0] = sinf(a * 0.5f); q[1] = 0; q[2] = 0; q[3] = cosf(a * 0.5f);
+}
+
+/* Overhead swings, repeated hard: forward-up through straight-up and over
+ * the top, then back down, at 25 rad/s. The accelerometer reports the
+ * centripetal force of a *longer* real arm than the model (mismatch), and
+ * clips at 8 g, exactly the conditions that used to fling the hand. */
+static void test_large_fast_swings_stay_stable(void) {
+    BsJcTracker t;
+    bs_jc_tracker_reset(&t, NULL, 1);
+    float q[4], p[3], prev[3] = {0, 0, 0};
+    const float dt = 0.005f, w = 25.0f, real_radius = 0.75f;
+    float angle = 0.44f, dir = 1.0f;
+    for (int i = 0; i < 100; ++i) {
+        pitch_q(angle, q);
+        bs_jc_tracker_update(&t, q, q, REST_ACC, NO_GYRO, dt);
+    }
+    bs_jc_tracker_pose(&t, q, prev);
+    float max_step = 0, max_off = 0;
+    for (int i = 0; i < 2400; ++i) {         /* 12 s of continuous swinging */
+        angle += dir * w * dt;
+        if (angle > 2.6f) dir = -1.0f;        /* ~149 deg: past vertical */
+        if (angle < -0.9f) dir = 1.0f;
+        pitch_q(angle, q);
+        /* Specific force in player frame: +1 g up plus centripetal toward
+         * the shoulder (w^2 r) along -forward; expressed in body axes. */
+        float fwd_y = sinf(angle), fwd_z = -cosf(angle);
+        float cy = 1.0f - w * w * real_radius * fwd_y / 9.80665f;
+        float cz = -w * w * real_radius * fwd_z / 9.80665f;
+        /* Rotate player -> body (inverse pitch) then XR -> sensor axes. */
+        float c = cosf(angle), s = sinf(angle);
+        float by = c * cy + s * cz, bz = -s * cy + c * cz;
+        float acc[3] = {0, -bz, by};
+        for (int k = 0; k < 3; ++k) {
+            if (acc[k] > 8.0f) acc[k] = 8.0f;
+            if (acc[k] < -8.0f) acc[k] = -8.0f;
+        }
+        float gyro[3] = {dir * w / (2.0f * 3.14159265f), 0, 0};
+        bs_jc_tracker_update(&t, q, q, acc, gyro, dt);
+        bs_jc_tracker_pose(&t, q, p);
+        float dx = p[0] - prev[0], dy = p[1] - prev[1], dz = p[2] - prev[2];
+        float step = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (step > max_step) max_step = step;
+        float o = sqrtf(t.offset[0] * t.offset[0] + t.offset[1] * t.offset[1] +
+                        t.offset[2] * t.offset[2]);
+        if (o > max_off) max_off = o;
+        for (int k = 0; k < 3; ++k) {
+            assert(isfinite(p[k]));
+            prev[k] = p[k];
+        }
+    }
+    printf("  swing: max step %.1f mm/sample, max inertial offset %.1f mm\n",
+           max_step * 1000.0f, max_off * 1000.0f);
+    /* Hand tip moves ~0.6 m * 25 rad/s * 5 ms = 75 mm per sample, plus the
+     * capped-prediction jump at direction reversal. No teleports. */
+    assert(max_step < 0.16f);
+    assert(max_off < 0.04f);
+    /* Stop: settles to the arm model with no leftover offset. */
+    pitch_q(0.44f, q);
+    for (int i = 0; i < 400; ++i)
+        bs_jc_tracker_update(&t, q, q, REST_ACC, NO_GYRO, dt);
+    assert(sqrtf(t.offset[0] * t.offset[0] + t.offset[1] * t.offset[1] +
+                 t.offset[2] * t.offset[2]) < 0.002f);
+}
+
+/* Pointing straight up/down used to flip the Euler yaw by 180 degrees. */
+static void test_arm_model_continuous_through_vertical(void) {
+    BsJcTracker t;
+    BsJcTrackerConfig cfg;
+    bs_jc_tracker_default_config(&cfg, 0);
+    cfg.inertial_gain = 0;
+    cfg.predict_s = 0;
+    bs_jc_tracker_reset(&t, &cfg, 0);
+    float q[4], p[3], prev[3];
+    pitch_q(1.40f, q);
+    bs_jc_tracker_update(&t, q, q, REST_ACC, NO_GYRO, 0.0f);
+    bs_jc_tracker_pose(&t, q, prev);
+    for (int i = 1; i <= 200; ++i) {
+        float a = 1.40f + 0.0017f * (float)i;   /* 1.40 -> 1.74 rad, crosses pi/2 */
+        pitch_q(a, q);
+        bs_jc_tracker_reset(&t, &cfg, 0);
+        bs_jc_tracker_update(&t, q, q, REST_ACC, NO_GYRO, 0.0f);
+        bs_jc_tracker_pose(&t, q, p);
+        float dx = p[0] - prev[0], dy = p[1] - prev[1], dz = p[2] - prev[2];
+        assert(sqrtf(dx * dx + dy * dy + dz * dz) < 0.003f);
+        for (int k = 0; k < 3; ++k) prev[k] = p[k];
+    }
+}
+
 int main(void) {
+    test_arm_model_continuous_through_vertical();
+    test_large_fast_swings_stay_stable();
     test_rest_is_stable_and_matches_layout();
     test_punch_translates_then_returns();
     test_prediction_and_bias();

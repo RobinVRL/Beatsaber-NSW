@@ -33,8 +33,7 @@ typedef struct BsJcTrackerConfig {
     float shoulder[3];          /* hand-side shoulder, head-relative (m) */
     float upper_arm;            /* shoulder -> elbow (m) */
     float forearm;              /* elbow -> grip (m) */
-    float elbow_yaw_ratio;      /* fraction of hand yaw taken by the elbow */
-    float elbow_pitch_ratio;    /* fraction of hand pitch taken by the elbow */
+    float elbow_ratio;          /* fraction of the hand's swing the elbow takes */
     float smooth_min_cutoff_hz; /* One-Euro: cutoff at rest */
     float smooth_beta;          /* One-Euro: cutoff gain per rad/s */
     float predict_s;            /* gyro extrapolation horizon */
@@ -55,7 +54,9 @@ typedef struct BsJcTracker {
     float gravity[3];           /* player-frame gravity estimate, g */
     float still_time_s;
     float model_pos[3][3];      /* last 3 arm-model positions (newest [0]) */
+    float model_dt[2];          /* intervals between those positions */
     int model_count;
+    float unreliable_s;         /* hold-off after sensor clipping */
     float model_acc[3];         /* low-passed arm-model acceleration */
     float lin_acc[3];           /* low-passed gravity-free acceleration */
     float vel[3];               /* residual velocity, m/s */

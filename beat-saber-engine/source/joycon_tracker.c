@@ -19,6 +19,12 @@
 #define JT_ACC_LP_TAU_S     0.025f
 #define JT_RESIDUAL_DEADBAND 0.35f   /* m/s^2: below this treat as noise */
 #define JT_MAX_DT           0.1f
+/* Large-swing robustness. */
+#define JT_SWING_RAD_S      4.0f     /* rotation where translation trust halves */
+#define JT_ACCEL_CLIP_G     7.5f     /* Joy-Con accelerometer range is +-8 g */
+#define JT_GYRO_CLIP_RAD_S  33.0f    /* gyro range +-2000 dps = 34.9 rad/s */
+#define JT_CLIP_HOLD_S      0.12f
+#define JT_PREDICT_MAX_RAD  0.20f
 
 typedef struct { float x, y, z, w; } Q;
 typedef struct { float x, y, z; } V;
@@ -81,12 +87,11 @@ void bs_jc_tracker_default_config(BsJcTrackerConfig *cfg, int hand) {
     /* Tuned so the recentered default aim lands near the previous fixed
      * elbow model's hand position (seated flat-screen layout). */
     cfg->shoulder[0] = hand ? 0.19f : -0.19f;
-    cfg->shoulder[1] = -0.12f;
-    cfg->shoulder[2] = 0.02f;
+    cfg->shoulder[1] = -0.08f;
+    cfg->shoulder[2] = -0.05f;
     cfg->upper_arm = 0.27f;
     cfg->forearm = 0.33f;
-    cfg->elbow_yaw_ratio = 0.45f;
-    cfg->elbow_pitch_ratio = 0.30f;
+    cfg->elbow_ratio = 0.40f;
     cfg->smooth_min_cutoff_hz = 1.2f;
     cfg->smooth_beta = 6.0f;
     cfg->predict_s = 0.030f;
@@ -106,18 +111,36 @@ void bs_jc_tracker_reset(BsJcTracker *t, const BsJcTrackerConfig *cfg, int hand)
     t->gravity[1] = 1.0f;
 }
 
-/* Shoulder -> elbow -> grip. The elbow swings with a fraction of the hand's
- * heading and elevation, as real arms do, instead of staying fixed. */
+static V vcross(V a, V b) {
+    return (V){a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x};
+}
+static float vdot(V a, V b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+
+/* Shortest-arc rotation taking unit vector a to unit vector b. */
+static Q qarc(V a, V b) {
+    float d = vdot(a, b);
+    if (d < -0.9999f) {                       /* opposite: any perpendicular */
+        V axis = vcross(a, (V){1, 0, 0});
+        if (vlen(axis) < 1e-3f) axis = vcross(a, (V){0, 1, 0});
+        axis = vk(axis, 1.0f / vlen(axis));
+        return (Q){axis.x, axis.y, axis.z, 0};
+    }
+    V c = vcross(a, b);
+    return qn((Q){c.x, c.y, c.z, 1.0f + d});
+}
+
+/* Shoulder -> elbow -> grip. The elbow follows a fraction of the hand's
+ * *swing* (direction change from the default aim; wrist twist ignored).
+ * Built from a shortest-arc quaternion rather than Euler yaw/pitch, so it is
+ * continuous when the Joy-Con passes straight up/down in overhead swings
+ * (atan2 yaw flips by 180 degrees there and made the hand teleport). */
 static V arm_model(const BsJcTrackerConfig *c, Q q) {
+    static const V f0 = {0.0f, 0.42594f, -0.90475f};   /* default aim, 0.44 rad up */
     V f = qr(q, (V){0, 0, -1});
-    float yaw = atan2f(-f.x, -f.z);
-    float fy = f.y > 1 ? 1 : f.y < -1 ? -1 : f.y;
-    float pitch = asinf(fy);
-    float ey = yaw * c->elbow_yaw_ratio * 0.5f, ep = pitch * c->elbow_pitch_ratio * 0.5f;
-    Q qy = {0, sinf(ey), 0, cosf(ey)};
-    Q qp = {sinf(ep), 0, 0, cosf(ep)};
-    V elbow = va(vload(c->shoulder), qr(qm(qy, qp), (V){0, -c->upper_arm, 0}));
-    return va(elbow, qr(q, (V){0, 0, -c->forearm}));
+    Q swing = qarc(f0, f);
+    Q elbow_rot = qslerp((Q){0, 0, 0, 1}, swing, c->elbow_ratio);
+    V elbow = va(vload(c->shoulder), qr(elbow_rot, (V){0, -c->upper_arm, 0}));
+    return va(elbow, vk(f, c->forearm));
 }
 
 void bs_jc_tracker_update(BsJcTracker *t, const float q_aim_f[4],
@@ -173,10 +196,29 @@ void bs_jc_tracker_update(BsJcTracker *t, const float q_aim_f[4],
     V model = arm_model(c, qload(t->q_filt));
     memmove(t->model_pos[1], t->model_pos[0], sizeof(t->model_pos[0]) * 2);
     vstore(model, t->model_pos[0]);
+    t->model_dt[1] = t->model_dt[0];
+    t->model_dt[0] = dt;
     if (t->model_count < 3) { ++t->model_count; return; }
 
+    /* Non-uniform second difference: poll intervals are not constant. */
     V p0 = vload(t->model_pos[0]), p1 = vload(t->model_pos[1]), p2 = vload(t->model_pos[2]);
-    V a_model = vk(va(vs(p0, vk(p1, 2.0f)), p2), 1.0f / (dt * dt));
+    float d0 = t->model_dt[0], d1 = t->model_dt[1] > 0 ? t->model_dt[1] : dt;
+    V a_model = vk(vs(vk(vs(p0, p1), 1.0f / d0), vk(vs(p1, p2), 1.0f / d1)),
+                   2.0f / (d0 + d1));
+
+    /* Reliability gate. In fast rotation the accelerometer is dominated by
+     * centripetal terms (w^2 * r): any arm-length mismatch, at 20 rad/s
+     * even 5 cm, reads as ~20 m/s^2 of fake translation, and big swings
+     * also clip the +-8 g accelerometer / +-2000 dps gyro. Translation is
+     * therefore only trusted while rotation is moderate, and fully
+     * suppressed (with a hold-off for the low-pass tails) when clipping. */
+    int saturated = a_mag > JT_ACCEL_CLIP_G;
+    for (int i = 0; i < 3; ++i)
+        if (fabsf(gyro[i]) * c->gyro_scale > JT_GYRO_CLIP_RAD_S) saturated = 1;
+    if (saturated) t->unreliable_s = JT_CLIP_HOLD_S;
+    else if (t->unreliable_s > 0) t->unreliable_s -= dt;
+    float wr = w_mag / JT_SWING_RAD_S;
+    float gate = t->unreliable_s > 0 ? 0.0f : 1.0f / (1.0f + wr * wr);
     V grav = vload(t->gravity);
     /* Sign of gravity tells whether the sensor reports specific force
      * (+1 g up at rest) or the gravity vector itself. */
@@ -185,14 +227,16 @@ void bs_jc_tracker_update(BsJcTracker *t, const float q_aim_f[4],
     float k = lp_alpha(dt, JT_ACC_LP_TAU_S);
     vstore(vlerp(vload(t->model_acc), a_model, k), t->model_acc);
     vstore(vlerp(vload(t->lin_acc), a_lin, k), t->lin_acc);
-    V residual = vk(vs(vload(t->lin_acc), vload(t->model_acc)), c->inertial_gain);
+    V residual = vk(vs(vload(t->lin_acc), vload(t->model_acc)), c->inertial_gain * gate);
     float rmag = vlen(residual);
     if (rmag < JT_RESIDUAL_DEADBAND) residual = (V){0, 0, 0};
     else residual = vk(residual, (rmag - JT_RESIDUAL_DEADBAND) / rmag);
 
     V vel = vload(t->vel), off = vload(t->offset);
     vel = va(vel, vk(residual, dt));
-    vel = vk(vel, expf(-dt / c->inertial_vel_tau_s));
+    /* Leak faster while untrusted so no stale velocity carries through. */
+    float vtau = c->inertial_vel_tau_s * (0.15f + 0.85f * gate);
+    vel = vk(vel, expf(-dt / vtau));
     if (still) vel = (V){0, 0, 0};                   /* ZUPT */
     off = va(off, vk(vel, dt));
     off = vk(off, expf(-dt / c->inertial_pos_tau_s)); /* spring to arm model */
@@ -211,8 +255,12 @@ void bs_jc_tracker_update(BsJcTracker *t, const float q_aim_f[4],
 void bs_jc_tracker_pose(const BsJcTracker *t, float q_out[4], float p_out[3]) {
     const BsJcTrackerConfig *c = &t->cfg;
     Q q = qload(t->q_filt);
+    /* Cap the extrapolated angle: uncapped, 30 ms at swing speed is ~40
+     * degrees of lead that visibly overshoots when the swing stops. */
     V w = vload(t->omega_player);
-    q = qn(qm(qexp(w, c->predict_s), q));
+    float wm = vlen(w), horizon = c->predict_s;
+    if (wm * horizon > JT_PREDICT_MAX_RAD) horizon = JT_PREDICT_MAX_RAD / wm;
+    q = qn(qm(qexp(w, horizon), q));
     V p = arm_model(c, q);
     p = va(p, va(vload(t->offset), vk(vload(t->vel), c->predict_s)));
     qstore(q, q_out);

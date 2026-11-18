@@ -10,6 +10,7 @@ private-sd/
 
 # Build output
 build/
+build_switch2/
 *.d
 *.a
 *.pdb

@@ -20,6 +20,7 @@
 
 #include "bionic_mmap.h"
 #include "util.h"
+#include "so_util.h"
 
 #define BS_PAGE_SIZE 0x1000u
 #define BS_MAP_ANONYMOUS 0x20
@@ -80,7 +81,10 @@ static size_t page_align(size_t count) {
 static bool window_contains(const void *p,size_t n) {
     uintptr_t a=(uintptr_t)p,b=(uintptr_t)g_window.base;
     size_t total=g_window.page_count*BS_PAGE_SIZE;
-    return g_window.ready && n && a<b+total && a+n>b;
+    if (g_window.ready && n && a<b+total && a+n>b) return true;
+    /* Switch 2: module data pages are svcMapMemory aliases as well. */
+    uintptr_t lo=0,hi=0;
+    return n && so_arena_range(&lo,&hi) && a<hi && a+n>lo;
 }
 #define BS_IO_BOUNCE (256u<<10)
 static devoptab_t g_bounce_tab;
@@ -157,9 +161,24 @@ static void window_initialize_locked(void) {
         if (R_FAILED(svcQueryMemory(&memory,&page_info,cursor)) ||
             memory.addr+memory.size<=cursor) break;
         if (memory.type==MemType_Unmapped) {
-            u64 aligned=(memory.addr+(BS_OC_ALIGN-1)) &
+            u64 lo=memory.addr,bound=memory.addr+memory.size;
+#if defined(__SWITCH2__)
+            /* The kernel refuses svcMapMemory outside the stack region
+             * (Eden doesn't check, so the Switch 1 build may overhang). */
+            if (lo<start) lo=start;
+            if (bound>finish) bound=finish;
+            if (bound<=lo) { cursor=memory.addr+memory.size; continue; }
+#endif
+            /* The Switch 2 module arena is reserved but partly unmapped:
+             * keep the larger free side of it. */
+            uintptr_t arena_lo=0,arena_hi=0;
+            if (so_arena_range(&arena_lo,&arena_hi) && lo<arena_hi && bound>arena_lo) {
+                u64 below=arena_lo>lo ? arena_lo-lo : 0;
+                u64 above=bound>arena_hi ? bound-arena_hi : 0;
+                if (above>=below) lo=arena_hi; else bound=arena_lo;
+            }
+            u64 aligned=(lo+(BS_OC_ALIGN-1)) &
                         ~(u64)(BS_OC_ALIGN-1);
-            u64 bound=memory.addr+memory.size;
             if (aligned<bound && bound-aligned>=BS_OC_MIN_BYTES) {
                 size_t avail=(size_t)(bound-aligned);
                 avail &= ~(BS_OC_ALIGN-1);

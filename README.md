@@ -21,7 +21,7 @@ Android, Bionic, JNI, EGL/GLES and OpenXR APIs that they expect.
 | Joy-Con gyro saber control | Working |
 | Audio (FFmpeg-backed Android media bridge) | Working |
 | Real Switch hardware | **Untested** |
-| Switch 2 (kaiHEN JIT) | Planned, see [docs/SWITCH2.md](docs/SWITCH2.md) |
+| Switch 2 (kaiHEN) | Builds (`SWITCH2=1`); untested on hardware, see [docs/SWITCH2.md](docs/SWITCH2.md) |
 
 Remaining visual and functional issues are tracked in
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
@@ -71,11 +71,11 @@ Hold a Joy-Con in each hand. Each Joy-Con's gyroscope aims its saber.
 | Grip | L | R |
 | A / X | D-pad Down | A |
 | B / Y | D-pad Left | B |
-| Menu (pause) | − | + |
+| Menu (pause) | âˆ’ | + |
 | Thumbstick | Left stick | Right stick |
 | Recenter saber | Press left stick + L | Press right stick + R |
 | Look around (head yaw/pitch) | Hold L + D-pad | |
-| Quit the loader | | Hold + and − together |
+| Quit the loader | | Hold + and âˆ’ together |
 
 Without motion sensors, the sticks aim the sabers instead.
 
@@ -100,7 +100,7 @@ docs/                Architecture, debugging, known issues, dev notes
 - [Getting the Quest files](docs/QUEST_FILES.md)
 - [Debugging and test tooling](docs/DEBUGGING.md): logs, Eden runner, diagnostic flag files
 - [Known issues](docs/KNOWN_ISSUES.md)
-- [Switch 2 / kaiHEN plan](docs/SWITCH2.md)
+- [Switch 2 / kaiHEN port](docs/SWITCH2.md)
 - [Contributing](CONTRIBUTING.md)
 - [Developer notes and audits](docs/dev-notes/): historical bring-up logs
 

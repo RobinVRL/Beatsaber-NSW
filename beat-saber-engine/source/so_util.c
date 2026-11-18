@@ -77,7 +77,50 @@ void so_free_temp(so_module *mod) {
   mod->shstrtab = NULL;
 }
 
-uint32_t so_finalize(so_module *mod) {
+/* The source of a code or memory alias must be plain heap (MemType_Heap, RW,
+ * no attributes). Heap pages that a driver or IPC shared (DeviceShared or
+ * IpcLocked) are refused with InvalidCurrentMemory. Reports the first bad
+ * page, then moves the image to a fresh copy. The old buffer is deliberately
+ * leaked so the allocator can't hand the same pages out again. */
+static bool so_restage(so_module *mod) {
+  const u64 staged_address = (u64)mod->load_base;
+  for (u64 a = staged_address; a < staged_address + mod->load_size;) {
+    MemoryInfo info; u32 page;
+    if (R_FAILED(svcQueryMemory(&info, &page, a))) break;
+    if (info.type != MemType_Heap || info.attr || info.perm != Perm_Rw) {
+      debugPrintf("[link] %s: staged page %p type=0x%x attr=0x%x perm=0x%x "
+                  "(block %p+%#llx)\n", mod->name, (void *)a, info.type,
+                  info.attr, info.perm, (void *)info.addr,
+                  (unsigned long long)info.size);
+      break;
+    }
+    a = info.addr + info.size;
+  }
+  void *fresh = memalign(0x1000, mod->load_size);
+  if (!fresh) return false;
+  memcpy(fresh, mod->load_base, mod->load_size);
+  const intptr_t move = (intptr_t)fresh - (intptr_t)mod->load_base;
+  if (mod->syms)      mod->syms      = (Elf64_Sym *)((uintptr_t)mod->syms + move);
+  if (mod->dynstrtab) mod->dynstrtab = (char *)((uintptr_t)mod->dynstrtab + move);
+  mod->load_base = fresh;
+  return true;
+}
+
+/* After mapping, load_base's pages are donated to the runtime alias and fault
+ * on access: the image is readable only via load_virtbase. mod->syms and
+ * dynstrtab were set to load_base for pre-finalize import resolution (when
+ * load_virtbase isn't mapped yet). Rebase them to load_virtbase so
+ * post-finalize lookups (dlsym -> so_lookup_export, e.g. libunity resolving
+ * il2cpp_init) read the live mapped .dynsym/.dynstr. */
+static void so_rebase_symbols(so_module *mod) {
+  const uintptr_t delta = (uintptr_t)mod->load_virtbase - (uintptr_t)mod->load_base;
+  if (mod->syms)      mod->syms      = (Elf64_Sym *)((uintptr_t)mod->syms + delta);
+  if (mod->dynstrtab) mod->dynstrtab = (char *)((uintptr_t)mod->dynstrtab + delta);
+}
+
+/* Switch 1, and Switch 2 outside kaiHEN (e.g. an emulator that grants the
+ * syscalls): map the module with the code memory syscalls directly. */
+static uint32_t so_finalize_switch1(so_module *mod) {
   // the kernel never allows W -> X transitions on code memory, so the RX
   // segments must be set first, straight from the freshly-mapped state;
   // everything else (data segments AND the alignment gaps lld leaves
@@ -104,35 +147,12 @@ uint32_t so_finalize(so_module *mod) {
   Result rc = svcMapProcessCodeMemory(process, runtime_address, staged_address,
                                      mod->load_size);
   for (int attempt = 0; R_FAILED(rc) && attempt < 3; ++attempt) {
-    // The source must be plain heap (MemType_Heap, RW, no attributes). Heap
-    // pages that a driver or IPC shared (DeviceShared/IpcLocked) are refused
-    // with InvalidCurrentMemory. Report the first bad page, then retry from a
-    // fresh copy. The old buffer is deliberately leaked so the allocator can't
-    // hand the same pages out again.
-    for (u64 a = staged_address; a < staged_address + mod->load_size;) {
-      MemoryInfo info; u32 page;
-      if (R_FAILED(svcQueryMemory(&info, &page, a))) break;
-      if (info.type != MemType_Heap || info.attr || info.perm != Perm_Rw) {
-        debugPrintf("[link] %s: staged page %p type=0x%x attr=0x%x perm=0x%x "
-                    "(block %p+%#llx)\n", mod->name, (void *)a, info.type,
-                    info.attr, info.perm, (void *)info.addr,
-                    (unsigned long long)info.size);
-        break;
-      }
-      a = info.addr + info.size;
-    }
-    void *fresh = memalign(0x1000, mod->load_size);
-    if (!fresh) break;
-    memcpy(fresh, mod->load_base, mod->load_size);
-    const intptr_t move = (intptr_t)fresh - (intptr_t)mod->load_base;
-    if (mod->syms)      mod->syms      = (Elf64_Sym *)((uintptr_t)mod->syms + move);
-    if (mod->dynstrtab) mod->dynstrtab = (char *)((uintptr_t)mod->dynstrtab + move);
-    mod->load_base = fresh;
-    staged_address = (u64)fresh;
+    if (!so_restage(mod)) break;
+    staged_address = (u64)mod->load_base;
     rc = svcMapProcessCodeMemory(process, runtime_address, staged_address,
                                  mod->load_size);
     debugPrintf("[link] %s: retry %d from fresh staging %p -> 0x%x\n",
-                mod->name, attempt + 1, fresh, rc);
+                mod->name, attempt + 1, mod->load_base, rc);
   }
   if (R_FAILED(rc)) {
     debugPrintf("[link] %s: svcMapProcessCodeMemory failed (handle=0x%x, result=0x%x)\n",
@@ -173,17 +193,178 @@ uint32_t so_finalize(so_module *mod) {
   free(is_x_page);
 
   // svcMapProcessCodeMemory donates the source pages (load_base) to the code
-  // mapping; afterwards load_base is in CodeMemory state and faults on access --
-  // the image is readable only via load_virtbase. mod->syms/dynstrtab were set to
-  // load_base for pre-finalize import resolution (when load_virtbase isn't mapped
-  // yet). Rebase them to load_virtbase now so post-finalize lookups (dlsym ->
-  // so_lookup_export, e.g. libunity resolving il2cpp_init) read the live mapped
-  // .dynsym/.dynstr instead of faulting on the donated source range.
-  const uintptr_t delta = (uintptr_t)mod->load_virtbase - (uintptr_t)mod->load_base;
-  if (mod->syms)      mod->syms      = (Elf64_Sym *)((uintptr_t)mod->syms + delta);
-  if (mod->dynstrtab) mod->dynstrtab = (char *)((uintptr_t)mod->dynstrtab + delta);
+  // mapping (CodeMemory state).
+  so_rebase_symbols(mod);
   return 0;
 }
+
+#if defined(__SWITCH2__)
+/* kaiHEN runs homebrew as the game, whose policy forbids the code mapping
+ * syscalls. RO makes them for us (private ldr:ro command 65010, through
+ * kaihen-jit.o's provider hooks): it maps a heap range as code and makes the
+ * whole range RX. One module therefore becomes two mappings:
+ *  - text, [0, end of the last PF_X segment): RX code via RO. The leading
+ *    read-only segment and alignment gaps are included; they only need R;
+ *  - data, the rest (RELRO, .data, .bss, gaps): RW via svcMapMemory, which a
+ *    game may use, but only with a destination in the stack region.
+ * Both must stay contiguous for PC-relative addressing, so modules are placed
+ * in the stack region, which the kernel also accepts for AliasCode on 39-bit
+ * address spaces (it lies outside the heap and alias regions). */
+Result __nx_jit_map_code(void *rx_addr, void *src_addr, size_t size);
+Result __nx_jit_unmap_code(void *rx_addr, void *src_addr, size_t size);
+
+/* hbloader under kaiHEN passes RO's ldr:ro session as an override. Without
+ * it (an emulator running the NRO directly), use the syscalls. */
+static bool so_use_ro(void) {
+  return smGetServiceOverride(smEncodeName("ldr:ro")) != INVALID_HANDLE;
+}
+
+/* The Quest libraries total about 170 MiB of load size. */
+#define SO_ARENA_MAX   ((u64)384 * 1024 * 1024)
+#define SO_ARENA_GUARD ((u64)0x10000)
+
+static struct {
+  u64 start, end, next;
+  bool tried;
+} g_arena;
+
+bool so_arena_range(uintptr_t *start, uintptr_t *end) {
+  if (!g_arena.start) return false;
+  *start = (uintptr_t)g_arena.start;
+  *end = (uintptr_t)g_arena.end;
+  return true;
+}
+
+/* One arena at the start of the largest free block of the stack region,
+ * bump-allocated, so the libraries don't fragment the region that the mmap
+ * overcommit window needs afterwards. Called with virtmem locked. */
+static bool so_arena_init_locked(void) {
+  if (g_arena.tried) return g_arena.start != 0;
+  g_arena.tried = true;
+  u64 region = 0, length = 0;
+  if (R_FAILED(svcGetInfo(&region, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0)) ||
+      R_FAILED(svcGetInfo(&length, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0)) ||
+      !length)
+    return false;
+  u64 best = 0, best_size = 0;
+  for (u64 cursor = region; cursor < region + length;) {
+    MemoryInfo info = {0}; u32 page = 0;
+    if (R_FAILED(svcQueryMemory(&info, &page, cursor)) || info.addr + info.size <= cursor)
+      break;
+    if (info.type == MemType_Unmapped) {
+      u64 lo = info.addr < region ? region : info.addr;
+      u64 hi = info.addr + info.size;
+      if (hi > region + length) hi = region + length;
+      if (hi > lo && hi - lo > best_size) { best = lo; best_size = hi - lo; }
+    }
+    cursor = info.addr + info.size;
+  }
+  if (best_size < 4 * SO_ARENA_GUARD) return false;
+  u64 size = best_size / 4;
+  if (size > SO_ARENA_MAX) size = SO_ARENA_MAX;
+  size &= ~0xFFFFull;
+  const u64 start = (best + SO_ARENA_GUARD + 0xFFFF) & ~0xFFFFull;
+  if (!virtmemAddReservation((void *)start, size)) return false;
+  g_arena.start = start;
+  g_arena.end = start + size;
+  g_arena.next = start;
+  debugPrintf("[link] module arena %p+%llu MiB in stack region %p+%llu MiB\n",
+              (void *)start, (unsigned long long)(size >> 20), (void *)region,
+              (unsigned long long)(length >> 20));
+  return true;
+}
+
+static void *so_arena_alloc(size_t size) {
+  void *out = NULL;
+  virtmemLock();
+  if (so_arena_init_locked()) {
+    const u64 at = g_arena.next;
+    if (size <= g_arena.end - at && g_arena.end - at - size >= SO_ARENA_GUARD) {
+      out = (void *)at;
+      g_arena.next = (at + size + SO_ARENA_GUARD + 0xFFFF) & ~0xFFFFull;
+    }
+  }
+  virtmemUnlock();
+  return out;
+}
+
+/* End of the text mapping: the page end of the last executable segment. */
+static size_t so_text_size(const so_module *mod) {
+  size_t text_end = 0;
+  for (int i = 0; i < mod->phnum; i++) {
+    const Elf64_Phdr *p = &mod->phdr[i];
+    if (p->p_type == PT_LOAD && (p->p_flags & PF_X)) {
+      const size_t end = ALIGN_MEM(p->p_vaddr + p->p_memsz, 0x1000);
+      if (end > text_end) text_end = end;
+    }
+  }
+  return text_end > mod->load_size ? mod->load_size : text_end;
+}
+
+uint32_t so_finalize(so_module *mod) {
+  if (!so_use_ro()) {
+    debugPrintf("[link] %s: no kaiHEN ldr:ro override, mapping with syscalls\n",
+                mod->name);
+    return so_finalize_switch1(mod);
+  }
+  const size_t text_size = so_text_size(mod);
+  for (int i = 0; i < mod->phnum; i++) {
+    const Elf64_Phdr *p = &mod->phdr[i];
+    if (p->p_type == PT_LOAD && (p->p_flags & PF_W) && p->p_memsz &&
+        p->p_vaddr < text_size) {
+      // A writable page inside the RX text mapping would fault on write.
+      debugPrintf("[link] %s: writable segment at %#llx overlaps text end %#zx\n",
+                  mod->name, (unsigned long long)p->p_vaddr, text_size);
+      return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
+  }
+  if (!text_size) {
+    debugPrintf("[link] %s: no executable segment\n", mod->name);
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  }
+
+  Result rc = __nx_jit_map_code(mod->load_virtbase, mod->load_base, text_size);
+  for (int attempt = 0; R_FAILED(rc) && attempt < 3; ++attempt) {
+    if (!so_restage(mod)) break;
+    rc = __nx_jit_map_code(mod->load_virtbase, mod->load_base, text_size);
+    debugPrintf("[link] %s: retry %d from fresh staging %p -> 0x%x\n",
+                mod->name, attempt + 1, mod->load_base, rc);
+  }
+  if (R_FAILED(rc)) {
+    debugPrintf("[link] %s: RO MapJitCode %p <- %p (%#zx) failed 0x%x\n", mod->name,
+                mod->load_virtbase, mod->load_base, text_size, rc);
+    return rc;
+  }
+  const size_t data_size = mod->load_size - text_size;
+  if (data_size) {
+    rc = svcMapMemory((u8 *)mod->load_virtbase + text_size,
+                      (u8 *)mod->load_base + text_size, data_size);
+    if (R_FAILED(rc)) {
+      debugPrintf("[link] %s: svcMapMemory data %p (%#zx) failed 0x%x\n", mod->name,
+                  (u8 *)mod->load_virtbase + text_size, data_size, rc);
+      Result cleanup = __nx_jit_unmap_code(mod->load_virtbase, mod->load_base, text_size);
+      if (R_FAILED(cleanup))
+        debugPrintf("[link] %s: unmapping text after failure returned 0x%x\n",
+                    mod->name, cleanup);
+      return rc;
+    }
+  }
+  debugPrintf("[link] %s: text %p+%#zx RX (RO), data +%#zx RW\n", mod->name,
+              mod->load_virtbase, text_size, data_size);
+  so_rebase_symbols(mod);
+  return 0;
+}
+#else
+bool so_arena_range(uintptr_t *start, uintptr_t *end) {
+  (void)start; (void)end;
+  return false;
+}
+
+uint32_t so_finalize(so_module *mod) {
+  return so_finalize_switch1(mod);
+}
+#endif
+
 
 int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   int res = 0;
@@ -279,6 +460,12 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   memset(mod->load_base, 0, mod->load_size);
 
   // reserve virtual memory space for the entire LOAD zone
+#if defined(__SWITCH2__)
+  // Inside the module arena, which is reserved as a whole.
+  mod->load_virtbase = so_arena_alloc(mod->load_size);
+  mod->load_memrv = NULL;
+  if (!mod->load_virtbase) {
+#else
   virtmemLock();
   mod->load_virtbase = virtmemFindCodeMemory(mod->load_size, 0x1000);
   mod->load_memrv = mod->load_virtbase
@@ -286,6 +473,7 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
                       : NULL;
   virtmemUnlock();
   if (!mod->load_virtbase || !mod->load_memrv) {
+#endif
     debugPrintf("so_load: no available code memory mapping for %s (%zu bytes)\n",
                 filename, mod->load_size);
     res = -5;
@@ -358,9 +546,11 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   return 0;
 
 err_free_load:
-  virtmemLock();
-  virtmemRemoveReservation(mod->load_memrv);
-  virtmemUnlock();
+  if (mod->load_memrv) {
+    virtmemLock();
+    virtmemRemoveReservation(mod->load_memrv);
+    virtmemUnlock();
+  }
 err_free_so:
   free(mod->so_base);
   mod->so_base = NULL;
@@ -1029,6 +1219,18 @@ int so_unload(so_module *mod) {
     so_free_temp(mod);
   }
 
+#if defined(__SWITCH2__)
+  // The arena space is not reused; hbloader releases leftover RO mappings
+  // when the NRO exits.
+  if (so_use_ro()) {
+    const size_t text_size = so_text_size(mod);
+    if (mod->load_size > text_size)
+      svcUnmapMemory((u8 *)mod->load_virtbase + text_size,
+                     (u8 *)mod->load_base + text_size, mod->load_size - text_size);
+    __nx_jit_unmap_code(mod->load_virtbase, mod->load_base, text_size);
+  } else
+#endif
+  {
   Handle process = code_process_handle();
   // remap everything as RW
   for (int i = 0; i < mod->phnum; i++) {
@@ -1043,9 +1245,12 @@ int so_unload(so_module *mod) {
   svcUnmapProcessCodeMemory(process, (u64)mod->load_virtbase, (u64)mod->load_base, mod->load_size);
 
   // release virtual address range
-  virtmemLock();
-  virtmemRemoveReservation(mod->load_memrv);
-  virtmemUnlock();
+  if (mod->load_memrv) {
+    virtmemLock();
+    virtmemRemoveReservation(mod->load_memrv);
+    virtmemUnlock();
+  }
+  }
 
   // remove from list
   if (so_list == mod) {
@@ -1166,6 +1371,13 @@ void so_patch_stack_canaries(so_module *mod) {
 // unmap, and flush caches. Returns 0 on success. Used to hook/replace specific
 // il2cpp methods that gate boot (no source recompilation available).
 int so_patch_code(void *dst, const void *src, size_t len) {
+#if defined(__SWITCH2__)
+  /* Text is RX through RO; hooks are written to load_base before
+   * so_finalize instead. */
+  (void)src; (void)len;
+  debugPrintf("[patch] %p: live code patching is unsupported on Switch 2\n", dst);
+  return -1;
+#else
   uintptr_t start = (uintptr_t)dst & ~0xFFFull;
   size_t maplen = ((((uintptr_t)dst + len) - start) + 0xFFF) & ~0xFFFull;
   size_t off = (uintptr_t)dst - start;
@@ -1188,4 +1400,5 @@ int so_patch_code(void *dst, const void *src, size_t len) {
   armICacheInvalidate(dst, len);
   debugPrintf("[patch] ok %p (%zu bytes)\n", dst, len);
   return 0;
+#endif
 }

@@ -97,6 +97,19 @@ static EGLContext bs_eglCreateContext(EGLDisplay d, EGLConfig config,
     copy_attribs(attribs, filtered, BS_EGL_MAX_ATTRIBS, "context");
     eglBindAPI(EGL_OPENGL_ES_API);
     EGLContext c = eglCreateContext(d, config, share, filtered);
+    if (!c) {
+        /* OunceVK's Zink (Switch 2) may stop at ES 3.1: retry a 3.2 request
+         * as 3.1. Unity reads the version it got from GL_VERSION. */
+        for (size_t i = 0; filtered[i] != EGL_NONE; i += 2) {
+            if (filtered[i] == EGL_CONTEXT_MINOR_VERSION && filtered[i + 1] > 1) {
+                BS_EGL_LOG("[egl] ES 3.%d context refused (0x%x), retrying 3.1\n",
+                           filtered[i + 1], eglGetError());
+                filtered[i + 1] = 1;
+                c = eglCreateContext(d, config, share, filtered);
+                break;
+            }
+        }
+    }
     BS_EGL_LOG("[egl] eglCreateContext(share=%p) -> %p err=0x%x\n",
                share, c, c ? 0 : eglGetError());
     return c;
@@ -557,13 +570,40 @@ static unsigned char g_shader_light[BS_MV_MAX_IDS], g_prog_light[BS_MV_MAX_IDS];
 static int prog_is_mono(GLuint p) {
     return p < BS_MV_MAX_IDS && g_prog_mv[p] == BS_PROG_MONO;
 }
+/* Whether the driver itself has GL_OVR_multiview2 (OunceVK's Zink may; Switch
+ * 1 Mesa nouveau doesn't). Then every multiview call passes straight through
+ * and none of the layered emulation below runs. Needs a current context. */
+static int g_native_mv = -1;
+static int native_mv(void) {
+    if (g_native_mv >= 0) return g_native_mv;
+    if (!eglGetCurrentContext()) return 0;
+    GLint n = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    int found = 0;
+    for (GLint i = 0; i < n && !found; ++i) {
+        const char *e = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+        found = e && !strcmp(e, "GL_OVR_multiview2");
+    }
+    g_native_mv = found;
+    debugPrintf("[gles:mv] native GL_OVR_multiview2: %s\n",
+                found ? "yes, passing through" : "no, emulating with layers");
+    return found;
+}
 static int mv_active(void) {
+    if (native_mv()) return 0;
     if (!(t_draw_fbo && t_draw_fbo < BS_MV_MAX_FBO && g_mv_fbo[t_draw_fbo])) return 0;
     if (prog_is_mono(t_program)) { ++g_mono_in_mv_draws; return 0; }
     return 1;
 }
 static void bs_glFramebufferTextureMultiviewOVR(GLenum target, GLenum attachment,
         GLuint texture, GLint level, GLint base_view, GLsizei num_views) {
+    if (native_mv()) {
+        typedef void (*Fn)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei);
+        static Fn native;
+        if (!native) native = (Fn)eglGetProcAddress("glFramebufferTextureMultiviewOVR");
+        if (native) native(target, attachment, texture, level, base_view, num_views);
+        return;
+    }
     if (!g_fb_texture)
         g_fb_texture = (BsFramebufferTextureFn)eglGetProcAddress("glFramebufferTexture");
     static int logged;
@@ -604,6 +644,10 @@ static void bs_glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
 }
 static void bs_glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment,
                                                      GLenum pname, GLint *params) {
+    if (native_mv()) {
+        glGetFramebufferAttachmentParameteriv(target, attachment, pname, params);
+        return;
+    }
     GLuint f = bound_fbo(target);
     int mv = f && f < BS_MV_MAX_FBO && g_mv_fbo[f];
     if (pname == BS_GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR) { *params = mv ? 2 : 0; return; }
@@ -619,12 +663,13 @@ static GLint native_ext_count(void) {
     return n;
 }
 static void bs_glGetIntegerv(GLenum pname, GLint *v) {
+    if (native_mv()) { glGetIntegerv(pname, v); return; }
     if (pname == BS_GL_MAX_VIEWS_OVR) { *v = 2; return; }
     glGetIntegerv(pname, v);
     if (pname == GL_NUM_EXTENSIONS) *v += BS_EXTRA_EXT;
 }
 static const GLubyte *bs_glGetStringi(GLenum name, GLuint index) {
-    if (name == GL_EXTENSIONS) {
+    if (name == GL_EXTENSIONS && !native_mv()) {
         GLint n = native_ext_count();
         if ((GLint)index >= n && (GLint)index < n + BS_EXTRA_EXT)
             return (const GLubyte *)g_extra_ext[index - (GLuint)n];
@@ -632,7 +677,7 @@ static const GLubyte *bs_glGetStringi(GLenum name, GLuint index) {
     return glGetStringi(name, index);
 }
 static const GLubyte *bs_glGetString(GLenum name) {
-    if (name != GL_EXTENSIONS) return glGetString(name);
+    if (name != GL_EXTENSIONS || native_mv()) return glGetString(name);
     static char *all;
     if (!all) {
         const char *base = (const char *)glGetString(GL_EXTENSIONS);
@@ -693,7 +738,7 @@ static char *insert_after_directives(char *s, const char *text) {
     return out;
 }
 static char *mv_rewrite(const char *src) {
-    if (!strstr(src, "GL_OVR_multiview")) return NULL;
+    if (native_mv() || !strstr(src, "GL_OVR_multiview")) return NULL;
     char *s = strdup(src);
     if (!s) return NULL;
     int vertex = strstr(s, "num_views") != NULL;
@@ -2153,10 +2198,15 @@ int bs_egl_host_preflight(void) {
         return -2;
     }
     eglBindAPI(EGL_OPENGL_ES_API);
-    static const EGLint ctx_attr[] = {EGL_CONTEXT_MAJOR_VERSION, 3,
+    EGLint ctx_attr[] = {EGL_CONTEXT_MAJOR_VERSION, 3,
         EGL_CONTEXT_MINOR_VERSION, 2, EGL_NONE};
     debugPrintf("[egl:preflight] creating ES3.2 context on host thread\n");
     EGLContext c = eglCreateContext(d, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (!c) {
+        debugPrintf("[egl:preflight] ES3.2 refused 0x%x, trying ES3.1\n", eglGetError());
+        ctx_attr[3] = 1;
+        c = eglCreateContext(d, cfg, EGL_NO_CONTEXT, ctx_attr);
+    }
     debugPrintf("[egl:preflight] context=%p err=0x%x\n", c, c ? 0 : eglGetError());
     if (!c) return -3;
     eglDestroyContext(d, c);

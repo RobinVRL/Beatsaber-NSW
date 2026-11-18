@@ -91,4 +91,10 @@ int so_dl_iterate_phdr(int (*callback)(void *info, size_t size, void *data), voi
 
 int so_patch_code(void *dst, const void *src, size_t len);
 
+/* Switch 2 (kaiHEN): modules live in one reserved arena of the stack region,
+ * text mapped as code by RO and data aliased with svcMapMemory. Reports the
+ * arena so the mmap window avoids it and bounces file I/O on its data pages.
+ * Always false on Switch 1. */
+bool so_arena_range(uintptr_t *start, uintptr_t *end);
+
 #endif

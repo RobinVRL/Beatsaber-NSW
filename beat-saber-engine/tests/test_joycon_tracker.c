@@ -60,7 +60,8 @@ static void test_prediction_and_bias(void) {
     assert(q[3] > 0.99999f);
     /* Yaw rotation: 0.5 rev/s about sensor +Z (XR +Y) predicts ahead. */
     const float spin[3] = {0, 0, 0.5f};
-    bs_jc_tracker_update(&t, ID, ID, REST_ACC, spin, 0.005f);
+    for (int i = 0; i < 6; ++i)                   /* 30 ms of rotation */
+        bs_jc_tracker_update(&t, ID, ID, REST_ACC, spin, 0.005f);
     bs_jc_tracker_pose(&t, q, p);
     assert(q[1] > 0.02f);
 }
@@ -167,7 +168,74 @@ static void test_arm_model_continuous_through_vertical(void) {
     }
 }
 
+static float yaw_of(const float q[4]) {     /* heading of -Z after rotation */
+    float fx = -2.0f * (q[0] * q[2] + q[3] * q[1]);
+    float fz = -(1.0f - 2.0f * (q[0] * q[0] + q[1] * q[1]));
+    return atan2f(-fx, -fz);
+}
+
+/* Horizontal slashes: Horizon's yaw trails the true motion by 50 ms (its
+ * gyro-only yaw smoothing). The gyro reports the truth. Output yaw must
+ * follow the truth, not Horizon. */
+static void test_horizontal_follows_gyro_not_lagging_fusion(void) {
+    BsJcTracker t;
+    BsJcTrackerConfig cfg;
+    bs_jc_tracker_default_config(&cfg, 1);
+    cfg.predict_s = 0;          /* measure the filter itself */
+    bs_jc_tracker_reset(&t, &cfg, 1);
+    const float dt = 0.005f, lag = 0.050f, amp = 1.0f, freq = 1.5f;
+    float q[4], p[3];
+    for (int i = 0; i < 100; ++i) {
+        float id[4] = {0, 0, 0, 1};
+        bs_jc_tracker_update(&t, id, id, REST_ACC, NO_GYRO, dt);
+    }
+    double err_out = 0, err_fusion = 0;
+    int n = 0;
+    for (int i = 0; i < 1200; ++i) {
+        float time = (float)i * dt;
+        float yaw_true = amp * sinf(2 * 3.14159265f * freq * time);
+        float yaw_lag = amp * sinf(2 * 3.14159265f * freq * (time - lag));
+        float rate = amp * 2 * 3.14159265f * freq * cosf(2 * 3.14159265f * freq * time);
+        float fused[4] = {0, sinf(yaw_lag * 0.5f), 0, cosf(yaw_lag * 0.5f)};
+        float world[4] = {0, sinf(yaw_true * 0.5f), 0, cosf(yaw_true * 0.5f)};
+        /* XR +Y == sensor +Z */
+        float gyro[3] = {0, 0, rate / (2.0f * 3.14159265f)};
+        bs_jc_tracker_update(&t, fused, world, REST_ACC, gyro, dt);
+        if (i < 400) continue;  /* settle */
+        bs_jc_tracker_pose(&t, q, p);
+        err_out += fabsf(yaw_of(q) - yaw_true);
+        err_fusion += fabsf(yaw_lag - yaw_true);
+        ++n;
+    }
+    err_out /= n;
+    err_fusion /= n;
+    printf("  horizontal: mean yaw error %.1f deg (fusion alone %.1f deg)\n",
+           err_out * 57.29578, err_fusion * 57.29578);
+    assert(err_out < err_fusion * 0.4);
+}
+
+/* Gyro reported in rad/s while the config assumes rev/s: the tracker must
+ * learn the real scale from Horizon's rotation. */
+static void test_gyro_scale_self_calibrates(void) {
+    BsJcTracker t;
+    bs_jc_tracker_reset(&t, NULL, 0);
+    const float dt = 0.005f, w = 4.0f;
+    float yaw = 0;
+    for (int i = 0; i < 1500; ++i) {
+        float dir = ((i / 100) & 1) ? -1.0f : 1.0f;
+        yaw += dir * w * dt;
+        float q[4] = {0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)};
+        float gyro[3] = {0, 0, dir * w};               /* rad/s, not rev/s */
+        bs_jc_tracker_update(&t, q, q, REST_ACC, gyro, dt);
+    }
+    printf("  gyro scale learned %.3f (true 1.0, assumed %.3f)\n",
+           t.gyro_scale_est, t.cfg.gyro_scale);
+    assert(fabsf(t.gyro_scale_est - 1.0f) < 0.08f);
+}
+
 int main(void) {
+    test_horizontal_follows_gyro_not_lagging_fusion();
+    test_gyro_scale_self_calibrates();
     test_arm_model_continuous_through_vertical();
     test_large_fast_swings_stay_stable();
     test_rest_is_stable_and_matches_layout();

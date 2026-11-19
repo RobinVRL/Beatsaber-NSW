@@ -33,7 +33,11 @@ typedef struct BsJcTrackerConfig {
     float shoulder[3];          /* hand-side shoulder, head-relative (m) */
     float upper_arm;            /* shoulder -> elbow (m) */
     float forearm;              /* elbow -> grip (m) */
-    float elbow_ratio;          /* fraction of the hand's swing the elbow takes */
+    float elbow_ratio;          /* fraction of a vertical swing the elbow takes */
+    float elbow_yaw_ratio;      /* fraction of a horizontal swing (more: real
+                                   horizontal slashes lead with the shoulder) */
+    float tilt_tau_s;           /* pull of pitch/roll toward Horizon's attitude */
+    float yaw_tau_s;            /* pull of yaw toward Horizon (drift removal) */
     float smooth_min_cutoff_hz; /* One-Euro: cutoff at rest */
     float smooth_beta;          /* One-Euro: cutoff gain per rad/s */
     float predict_s;            /* gyro extrapolation horizon */
@@ -48,6 +52,10 @@ typedef struct BsJcTracker {
     BsJcTrackerConfig cfg;
     int hand;                   /* 0 left, 1 right */
     int initialized;
+    float q_est[4];             /* gyro-integrated aim, anchored to Horizon */
+    float q_prev_aim[4];        /* last Horizon aim, for scale calibration */
+    float scale_h, scale_g;     /* EMAs: Horizon angle vs raw gyro angle */
+    float gyro_scale_est;       /* self-calibrated sensor units -> rad/s */
     float q_filt[4];            /* smoothed aim orientation (xyzw) */
     float omega_player[3];      /* bias-corrected angular velocity, rad/s */
     float gyro_bias[3];         /* sensor-frame bias, sensor units */

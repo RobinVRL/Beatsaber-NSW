@@ -186,6 +186,11 @@ static int backend_read_motion(const BsRawFrame *frame, unsigned hand,
         }
         JCLOG("hand %u motion started npad %u style %#x handle=%#x\n",
               hand, frame->id, frame->style, handle.type_value);
+        /* Horizon's default (Standard) zero-drift filter swallows small and
+         * moderate rotations; yaw has no gravity reference to recover it,
+         * so horizontal motion felt muted. The tracker removes drift itself. */
+        Result zrc = hidSetGyroscopeZeroDriftMode(handle, HidGyroscopeZeroDriftMode_Loose);
+        if (R_FAILED(zrc)) JCLOG("hand %u zero-drift mode not set: %#x\n", hand, zrc);
         imu->handle = handle;
         imu->id = frame->id;
         imu->style = frame->style;

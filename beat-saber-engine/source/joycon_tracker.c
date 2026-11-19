@@ -92,8 +92,13 @@ void bs_jc_tracker_default_config(BsJcTrackerConfig *cfg, int hand) {
     cfg->upper_arm = 0.27f;
     cfg->forearm = 0.33f;
     cfg->elbow_ratio = 0.40f;
-    cfg->smooth_min_cutoff_hz = 1.2f;
-    cfg->smooth_beta = 6.0f;
+    cfg->elbow_yaw_ratio = 0.55f;
+    cfg->tilt_tau_s = 0.25f;
+    cfg->yaw_tau_s = 2.0f;
+    /* Gyro integration is already smooth; this filter now only has to hide
+     * residual noise, so it can open up sooner (less lag in swings). */
+    cfg->smooth_min_cutoff_hz = 1.5f;
+    cfg->smooth_beta = 12.0f;
     cfg->predict_s = 0.030f;
     cfg->gyro_scale = 2.0f * JT_PI;       /* libnx reports revolutions/s */
     cfg->inertial_gain = 1.0f;
@@ -108,7 +113,10 @@ void bs_jc_tracker_reset(BsJcTracker *t, const BsJcTrackerConfig *cfg, int hand)
     else bs_jc_tracker_default_config(&t->cfg, hand);
     t->hand = hand;
     t->q_filt[3] = 1.0f;
+    t->q_est[3] = 1.0f;
+    t->q_prev_aim[3] = 1.0f;
     t->gravity[1] = 1.0f;
+    t->gyro_scale_est = t->cfg.gyro_scale;
 }
 
 static V vcross(V a, V b) {
@@ -138,7 +146,12 @@ static V arm_model(const BsJcTrackerConfig *c, Q q) {
     static const V f0 = {0.0f, 0.42594f, -0.90475f};   /* default aim, 0.44 rad up */
     V f = qr(q, (V){0, 0, -1});
     Q swing = qarc(f0, f);
-    Q elbow_rot = qslerp((Q){0, 0, 0, 1}, swing, c->elbow_ratio);
+    /* Swing axis near vertical = horizontal slash: let the elbow take more
+     * of it. Weighted by axis, so still continuous everywhere. */
+    float sn = sqrtf(swing.x * swing.x + swing.y * swing.y + swing.z * swing.z);
+    float horiz = sn > 1e-6f ? (swing.y / sn) * (swing.y / sn) : 0.0f;
+    float ratio = c->elbow_ratio + (c->elbow_yaw_ratio - c->elbow_ratio) * horiz;
+    Q elbow_rot = qslerp((Q){0, 0, 0, 1}, swing, ratio);
     V elbow = va(vload(c->shoulder), qr(elbow_rot, (V){0, -c->upper_arm, 0}));
     return va(elbow, vk(f, c->forearm));
 }
@@ -156,16 +169,62 @@ void bs_jc_tracker_update(BsJcTracker *t, const float q_aim_f[4],
     V a_player = qr(q_world, sensor_vec_to_xr(accel_g));
     if (!t->initialized) {
         qstore(q_aim, t->q_filt);
+        qstore(q_aim, t->q_est);
+        qstore(q_aim, t->q_prev_aim);
         vstore(a_player, t->gravity);
         t->initialized = 1;
     }
 
+    /* Self-calibrate gyro units against Horizon's own rotation, so a wrong
+     * unit assumption can't make gyro-driven rotation too fast or slow.
+     * Only sustained, unclipped rotation is used. */
+    float raw[3] = {gyro[0] - t->gyro_bias[0], gyro[1] - t->gyro_bias[1],
+                    gyro[2] - t->gyro_bias[2]};
+    float raw_mag = sqrtf(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
+    {
+        Q pa = qload(t->q_prev_aim);
+        float d = fabsf(pa.x*q_aim.x + pa.y*q_aim.y + pa.z*q_aim.z + pa.w*q_aim.w);
+        float ang = 2.0f * acosf(d > 1.0f ? 1.0f : d);
+        float rate = raw_mag * t->gyro_scale_est;
+        int clipped = vlen(a_player) > JT_ACCEL_CLIP_G;
+        for (int i = 0; i < 3; ++i)
+            if (fabsf(gyro[i]) * t->gyro_scale_est > JT_GYRO_CLIP_RAD_S) clipped = 1;
+        if (dt > 0 && !clipped && rate > 1.5f && ang < 1.5f) {
+            t->scale_h = t->scale_h * 0.99f + ang;
+            t->scale_g = t->scale_g * 0.99f + raw_mag * dt;
+            if (t->scale_g > 0.3f) {
+                float s = t->scale_h / t->scale_g;
+                if (s > 0.01f && s < 12.0f) t->gyro_scale_est = s;
+            }
+        }
+        qstore(q_aim, t->q_prev_aim);
+    }
+
     /* Bias-corrected angular velocity, expressed in the player frame. */
-    float g_corr[3] = {(gyro[0] - t->gyro_bias[0]) * c->gyro_scale,
-                       (gyro[1] - t->gyro_bias[1]) * c->gyro_scale,
-                       (gyro[2] - t->gyro_bias[2]) * c->gyro_scale};
+    float g_corr[3] = {raw[0] * t->gyro_scale_est, raw[1] * t->gyro_scale_est,
+                       raw[2] * t->gyro_scale_est};
     V w_player = qr(q_world, sensor_vec_to_xr(g_corr));
     float w_mag = vlen(w_player);
+
+    /* Gyro-driven orientation. Horizon's fused attitude re-anchors tilt
+     * fast (gravity makes it trustworthy) but yaw only slowly: its yaw is
+     * gyro-only and passes through its smoothing / zero-drift filter, which
+     * made horizontal motion lag. Swing-twist split of the error about
+     * world up separates the two. Large errors (after clipping) snap back. */
+    if (dt > 0) {
+        Q e = qload(t->q_est);
+        e = qn(qm(qexp(w_player, dt), e));
+        Q err = qm(q_aim, qc(e));
+        if (err.w < 0) err = (Q){-err.x, -err.y, -err.z, -err.w};
+        Q twist = qn((Q){0, err.y, 0, err.w});
+        Q tilt = qm(err, qc(twist));
+        float err_ang = 2.0f * acosf(err.w > 1.0f ? 1.0f : err.w);
+        float at = lp_alpha(dt, c->tilt_tau_s), ay = lp_alpha(dt, c->yaw_tau_s);
+        if (err_ang > 0.5f) { at = ay = lp_alpha(dt, 0.05f); }
+        Q ident = {0, 0, 0, 1};
+        e = qn(qm(qm(qslerp(ident, tilt, at), qslerp(ident, twist, ay)), e));
+        qstore(e, t->q_est);
+    }
 
     /* Stillness: learns gyro bias and gravity, and gates zero-velocity. */
     float a_mag = vlen(a_player);
@@ -180,14 +239,17 @@ void bs_jc_tracker_update(BsJcTracker *t, const float q_aim_f[4],
         vstore(vlerp(vload(t->gravity), a_player, lp_alpha(dt, JT_GRAVITY_TAU_S)),
                t->gravity);
     }
-    vstore(w_player, t->omega_player);
+    /* Prediction velocity: lightly smoothed so an abrupt direction change
+     * doesn't flip the extrapolation from +cap to -cap in one sample. */
+    vstore(vlerp(vload(t->omega_player), w_player, lp_alpha(dt, 0.015f)),
+           t->omega_player);
 
     /* One-Euro orientation filter: cutoff rises with angular speed. */
     if (dt > 0) {
         float cutoff = c->smooth_min_cutoff_hz + c->smooth_beta * w_mag;
         float tau = 1.0f / (2.0f * JT_PI * cutoff);
         float alpha = 1.0f / (1.0f + tau / dt);
-        qstore(qn(qslerp(qload(t->q_filt), q_aim, alpha)), t->q_filt);
+        qstore(qn(qslerp(qload(t->q_filt), qload(t->q_est), alpha)), t->q_filt);
     }
 
     /* Inertial residual: what the accelerometer measures beyond the arm

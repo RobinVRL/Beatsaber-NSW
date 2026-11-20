@@ -1,0 +1,13 @@
+build/
+build_switch2/
+*.nro
+*.elf
+*.nacp
+*.map
+*.o
+*.d
+*.a
+*.so
+*.apk
+*.obb
+*.log

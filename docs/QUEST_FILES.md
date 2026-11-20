@@ -44,6 +44,16 @@ Check that `-InspectOnly` reports `versionName=1.46.0_34060`. Other versions
 have different native libraries and will not work without changes to the
 loader.
 
+## Without a headset (unofficial)
+
+The third-party Chrome/Edge extension
+[DownQuest](https://github.com/ptrpaws/DownQuest) can download builds of apps
+you own directly from Meta after you sign in on Meta's website, including
+older versions where your account can still access them. It is not an official
+Meta service, needs browser/account permissions, and may stop working. Pick
+the **1.46.0_34060** build and its OBB, then copy them into `SwitchPort/` as
+above. Never share Meta passwords, cookies or tokens.
+
 ## Optional: staging the native libraries for analysis
 
 `import-report.ps1` and `quest-analysis/` look at the extracted `.so` files.

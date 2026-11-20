@@ -90,11 +90,11 @@ Hold a Joy-Con in each hand. Each Joy-Con's gyroscope aims its saber.
 | Grip | L | R |
 | A / X | D-pad Down | A |
 | B / Y | D-pad Left | B |
-| Menu (pause) | âˆ’ | + |
+| Menu (pause) | − | + |
 | Thumbstick | Left stick | Right stick |
 | Recenter saber | Press left stick + L | Press right stick + R |
 | Look around (head yaw/pitch) | Hold L + D-pad | |
-| Quit the loader | | Hold + and âˆ’ together |
+| Quit the loader | | Hold + and − together |
 
 Without motion sensors, the sticks aim the sabers instead.
 

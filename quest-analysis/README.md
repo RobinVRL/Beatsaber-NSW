@@ -11,7 +11,8 @@ From the repository root in Windows PowerShell:
     py -3 quest-analysis/analyze_elf.py --json-out quest-analysis/example-report.json --text-out quest-analysis/example-report.txt
     py -3 -m unittest discover -s quest-analysis -p 'test_*.py' -v
 
-Default input is switch-port/import/quest-engine/APK/lib/arm64-v8a. Pass
+Default input is import/quest-engine/APK/lib/arm64-v8a (created by
+scripts/stage-quest-engine.ps1). Pass
 --input PATH to inspect a different staging directory, --format json to
 print the complete JSON report, or --sample-limit N to select the number
 of representative unresolved imports in text mode.

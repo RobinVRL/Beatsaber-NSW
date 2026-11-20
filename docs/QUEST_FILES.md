@@ -25,10 +25,10 @@ the Android APK.
 
    ```powershell
    # Show the installed version and package paths only (copies nothing)
-   & .\scripts\pull-owned-quest-apk.ps1 -InspectOnly
+   & .\tools\pull-owned-quest-apk.ps1 -InspectOnly
 
    # Copy the APK(s) and OBB into import/quest-beat-saber/
-   & .\scripts\pull-owned-quest-apk.ps1 -IncludeObb
+   & .\tools\pull-owned-quest-apk.ps1 -IncludeObb
    ```
 
    Use `-Serial <id>` if more than one device is connected.
@@ -56,12 +56,12 @@ above. Never share Meta passwords, cookies or tokens.
 
 ## Optional: staging the native libraries for analysis
 
-`import-report.ps1` and `quest-analysis/` look at the extracted `.so` files.
+`import-report.ps1` and `tools/quest-analysis/` look at the extracted `.so` files.
 To extract them, run:
 
 ```powershell
-& .\scripts\stage-quest-engine.ps1          # -> import/quest-engine/
-& .\beat-saber-engine\import-report.ps1     # unresolved-import summary
+& .\tools\stage-quest-engine.ps1          # -> import/quest-engine/
+& .\import-report.ps1     # unresolved-import summary
 ```
 
 Building and running the loader doesn't need this step.

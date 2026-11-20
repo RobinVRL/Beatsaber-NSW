@@ -11,12 +11,12 @@ file next to it. This is slow, but no lines are lost if the loader crashes.
 
 ## Eden test runner
 
-`beat-saber-engine/tests/run_eden_game.ps1` launches the NRO in Eden, watches
+`tests/run_eden_game.ps1` launches the NRO in Eden, watches
 the guest log and takes screenshots of the Eden window:
 
 ```powershell
 $env:EDEN_EXE = 'D:\Eden\eden.exe'
-& .\beat-saber-engine\tests\run_eden_game.ps1 -MaxSeconds 165 -QuietSeconds 30 -ShotEverySeconds 5
+& .\tests\run_eden_game.ps1 -MaxSeconds 165 -QuietSeconds 30 -ShotEverySeconds 5
 ```
 
 Notes:
@@ -67,20 +67,20 @@ of them change what is rendered.
 
 ## Host-side tests
 
-`beat-saber-engine/tests/` has C self-tests for individual bridges (JNI,
+`tests/` has C self-tests for individual bridges (JNI,
 ELF loading, `madvise`, GameActivity and so on). The headers in the shim
 folders let them build on a PC. It also has Python tests for the tools.
 Tests named `test_original_*` and the `*_elf` tests inspect the real Quest
-libraries. They need `scripts/stage-quest-engine.ps1` to have been run first.
+libraries. They need `tools/stage-quest-engine.ps1` to have been run first.
 Examples:
 
 ```powershell
-python -m unittest discover -s beat-saber-engine/tests -p "test_*.py"
-python -m unittest quest-analysis/test_analyze_elf.py
+python -m unittest discover -s tests -p "test_*.py"
+python -m unittest tools/quest-analysis/test_analyze_elf.py
 
 # Strict JNI self-test (needs any jni.h, e.g. from a JDK or Android NDK)
-clang -std=c11 -Wall -Wextra -Werror -I<path-to-jni.h> -Ibeat-saber-engine/source `
-  beat-saber-engine/tests/jni_gameactivity_strict_selftest.c beat-saber-engine/source/jni_bridge.c `
+clang -std=c11 -Wall -Wextra -Werror -I<path-to-jni.h> -Isource `
+  tests/jni_gameactivity_strict_selftest.c source/jni_bridge.c `
   -o jni_selftest.exe
 .\jni_selftest.exe
 ```

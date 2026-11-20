@@ -1,6 +1,5 @@
 # Game files: never commit
-SwitchPort/*
-!SwitchPort/README.md
+SwitchPort/
 import/
 private-sd/
 *.apk
@@ -24,13 +23,13 @@ build_switch2/
 *.lst
 
 # Optional prebuilt NVK SDK
-beat-saber-engine/nvk-sdk/
+nvk-sdk/
 
 # Reports, dumps and logs
 abi-report.json
 latest_unresolved_imports.txt
-quest-analysis/*.json
-quest-analysis/*.txt
+tools/quest-analysis/*.json
+tools/quest-analysis/*.txt
 shaderdump/
 *.log
 *.png

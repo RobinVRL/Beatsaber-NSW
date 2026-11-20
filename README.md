@@ -59,25 +59,26 @@ Requirements:
   [Eden](https://eden-emulator.github.io/) emulator.
 
 ```powershell
-# 1. Put your files in SwitchPort/ (see SwitchPort/README.md)
+# 1. Create a SwitchPort/ folder in the repository root (git-ignored) and
+#    put your files in it (see docs/QUEST_FILES.md):
 #    SwitchPort/beat-saber.apk
 #    SwitchPort/main.3491.com.beatgames.beatsaber.obb
 
 # 2. Build
-& .\beat-saber-engine\build.ps1 -Target BeatSaberQuestLoaderLifecycle
+& .\build.ps1 -Target BeatSaberQuestLoaderLifecycle
 
 # 3. Stage onto the SD card (or Eden's sdmc folder). The path must end in
 #    switch\beat-saber-quest
 $dest = 'D:\switch\beat-saber-quest'
-& .\beat-saber-engine\prepare-sd.ps1 -Destination $dest -IncludeAssets -DryRun
-& .\beat-saber-engine\prepare-sd.ps1 -Destination $dest -IncludeAssets
+& .\prepare-sd.ps1 -Destination $dest -IncludeAssets -DryRun
+& .\prepare-sd.ps1 -Destination $dest -IncludeAssets
 ```
 
 Then launch `BeatSaberQuestLoader.nro` from the Homebrew Menu. Use
 **title-override (full-memory) mode**, not applet mode. On later rebuilds,
 use `-LoaderOnly` instead of `-IncludeAssets` to copy only the loader.
 
-See [beat-saber-engine/README.md](beat-saber-engine/README.md) for full build,
+See [docs/BUILDING.md](docs/BUILDING.md) for full build,
 staging and troubleshooting details.
 
 ## Controls
@@ -101,26 +102,26 @@ Without motion sensors, the sticks aim the sabers instead.
 ## Repository layout
 
 ```
-beat-saber-engine/   The NRO: loader, Android/Bionic/JNI/EGL/OpenXR bridges
-  source/            C sources
-  tests/             Host-side unit tests (C + Python) and Eden test runners
-  tools/             Developer tools
-  build.ps1          Build wrapper around the devkitPro Makefile
-  prepare-sd.ps1     Stages loader + your Quest files into an SD layout
-scripts/             Pull the APK from your headset; stage engine libraries
-quest-analysis/      Read-only ELF/ABI analyzer for the Quest libraries
-SwitchPort/          Put your own APK/OBB here (git-ignored)
-docs/                Architecture, debugging, known issues, dev notes
+source/              C sources: loader, Android/Bionic/JNI/EGL/OpenXR bridges
+tests/               Host-side unit tests (C + Python) and Eden test runners
+tools/               APK pull/staging scripts, ELF/ABI analyzer (quest-analysis/)
+assets/              NRO icon
+docs/                Building, architecture, debugging, known issues, dev notes
+Makefile, build.ps1  devkitPro build
+prepare-sd.ps1       Stages loader + your Quest files into an SD layout
+setup.ps1/.bat       One-step setup for players (no build tools needed)
+SwitchPort/          Create it and put your own APK/OBB here (git-ignored)
 ```
 
 ## Documentation
 
+- [Building from source](docs/BUILDING.md)
 - [Architecture](docs/ARCHITECTURE.md): how the loader, bridges and renderer fit together
 - [Getting the Quest files](docs/QUEST_FILES.md)
 - [Debugging and test tooling](docs/DEBUGGING.md): logs, Eden runner, diagnostic flag files
 - [Known issues](docs/KNOWN_ISSUES.md)
 - [Switch 2 / kaiHEN port](docs/SWITCH2.md)
-- [Contributing](CONTRIBUTING.md)
+- [Contributing](docs/CONTRIBUTING.md)
 - [Developer notes and audits](docs/dev-notes/): historical bring-up logs
 
 ## Legal

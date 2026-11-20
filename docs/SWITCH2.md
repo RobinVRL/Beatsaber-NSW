@@ -23,7 +23,7 @@ directory: junctions for `devkitA64`, `tools`, `msys2`, `libnx` and
 ## Build
 
 ```powershell
-.\beat-saber-engine\build.ps1 -Switch2 -Target BeatSaberQuestLoaderLifecycle
+.\build.ps1 -Switch2 -Target BeatSaberQuestLoaderLifecycle
 # or: make SWITCH2=1 TARGET=BeatSaberQuestLoaderLifecycle
 ```
 

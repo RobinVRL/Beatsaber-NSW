@@ -64,7 +64,14 @@ export LD := $(CXX)
 export OFILES := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) $(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD)
 export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
-export NROFLAGS += --icon=$(LIBNX)/default_icon.jpg --nacp=$(OUTPUT).nacp
+# Official Beat Saber icon (from the Quest APK, res/mipmap-xxxhdpi/app_icon.png,
+# scaled to the 256x256 JPEG NRO icons use). Override with NRO_ICON=<path>.
+# (Not APP_ICON: libnx's switch_rules presets that to its default icon.)
+NRO_ICON ?= $(CURDIR)/assets/icon.jpg
+ifeq ($(wildcard $(NRO_ICON)),)
+NRO_ICON := $(LIBNX)/default_icon.jpg
+endif
+export NROFLAGS += --icon=$(NRO_ICON) --nacp=$(OUTPUT).nacp
 
 .PHONY: all clean $(BUILD)
 all: $(BUILD)

@@ -4,7 +4,10 @@ param(
     [string]$Target = 'BeatSaberQuestLoader',
     # Build for Switch 2 (kaiHEN). DEVKITPRO must contain libounce and
     # portlibs/switch2 (the ounce-devkit packages); see docs/SWITCH2.md.
-    [switch]$Switch2
+    [switch]$Switch2,
+    # Optional 256x256 JPEG to embed as the NRO icon. When omitted, the
+    # Makefile uses the official Beat Saber icon in assets/icon.jpg.
+    [string]$Icon = ''
 )
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -38,6 +41,13 @@ if ($Switch2) {
     }
     $platformArgs = @('SWITCH2=1')
     $suffix = '_switch2'
+}
+if ($Icon) {
+    if (-not (Test-Path -LiteralPath $Icon)) { throw "Missing NRO icon: $Icon" }
+    $iconPath = (Resolve-Path -LiteralPath $Icon).Path -replace '^([A-Za-z]):', { '/' + $_.Groups[1].Value.ToLower() } -replace '\\', '/'
+    $platformArgs += "NRO_ICON=$iconPath"
+} elseif (-not (Test-Path -LiteralPath (Join-Path $project 'assets/icon.jpg'))) {
+    throw 'Missing assets/icon.jpg (official Beat Saber NRO icon).'
 }
 if ($Clean) {
     & $make -C $project clean "TARGET=$Target" @platformArgs

@@ -220,7 +220,11 @@ if ($NroPath) {
         # /releases (not /releases/latest) so pre-releases are included.
         $releases = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repository/releases?per_page=10"
     } catch { Fail "Could not reach GitHub ($($_.Exception.Message)). Re-run with -NroPath <file.nro> to use a downloaded NRO." }
-    $release = @($releases | Where-Object { -not $_.draft })[0]
+    # Skip releases of other ports (e.g. v1408-*) that lack these NROs.
+    $release = @($releases | Where-Object {
+        $r = $_
+        -not $r.draft -and @($nroNames | Where-Object { $r.assets.name -notcontains $_ }).Count -eq 0
+    })[0]
     if (-not $release) { Fail 'No published release found.' }
     Write-Host "  Release: $($release.name) ($($release.tag_name))"
     foreach ($n in $nroNames) {

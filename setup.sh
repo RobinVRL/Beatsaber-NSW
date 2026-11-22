@@ -164,7 +164,8 @@ elif [ $skip_download -eq 0 ]; then
     releases=$(curl -fsSL -H 'User-Agent: beatsaber-nsw-setup' -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/$repository/releases?per_page=10") ||
         fail 'Could not reach GitHub. Re-run with --nro <file.nro> to use a downloaded NRO.'
-    tag=$(grep -m1 -o '"tag_name": *"[^"]*"' <<<"$releases" | sed 's/.*"\([^"]*\)"$/\1/')
+    # Skip releases of the separate 1.40.8 port (v1408-*).
+    tag=$(grep -o '"tag_name": *"[^"]*"' <<<"$releases" | sed 's/.*"\([^"]*\)"$/\1/' | grep -v '^v1408-' | head -n1)
     [ -n "$tag" ] || fail 'No published release found.'
     echo "  Release: $tag"
     for n in "${nro_names[@]}"; do

@@ -5,6 +5,12 @@ loader uses a different folder and file set; see `SETUP.md` on the
 [`main`](../../tree/main) branch. Both ports can sit on the same SD card side
 by side (`switch/beat-saber-quest/` and `switch/beat-saber-1408/`).
 
+> [!WARNING]
+> **Online multiplayer is experimental and still buggy.** It works in Eden
+> (official servers or BeatTogether through MultiplayerCore, staged with
+> `-IncludeMods`) but is untested on real hardware. Expect disconnects,
+> desyncs or crashes.
+
 ## What you need
 
 - Beat Saber Quest **1.40.8_7379** APK, optionally MBF-patched (Scotland2)

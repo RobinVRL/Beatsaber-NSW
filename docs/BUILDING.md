@@ -47,6 +47,21 @@ $dest = 'E:\switch\beat-saber-quest'          # or <Eden sdmc>\switch\beat-saber
 The NRO is copied as `BeatSaberQuestLoader.nro`. The APK and OBB are copied
 next to it unchanged, and the loader reads them in place.
 
+## Linux
+
+`build.sh`, `prepare-sd.sh` and `setup.sh` do the same jobs as the
+PowerShell scripts. You need `bash`, `make`, `unzip` and `curl`. `DEVKITPRO`
+defaults to `/opt/devkitpro`.
+
+```bash
+chmod +x *.sh
+./build.sh --target BeatSaberQuestLoaderLifecycle [--clean] [--switch2]
+./prepare-sd.sh --destination /media/$USER/SD/switch/beat-saber-quest --include-assets --dry-run
+./prepare-sd.sh --destination /media/$USER/SD/switch/beat-saber-quest --include-assets
+./prepare-sd.sh --destination /media/$USER/SD/switch/beat-saber-quest --loader-only
+./setup.sh [--console switch|switch2|both] [--destination DIR] [--nro FILE] [--skip-download]
+```
+
 ## Run
 
 Open the Homebrew Menu in **full-memory title mode** (hold R while launching

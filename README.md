@@ -115,6 +115,7 @@ SwitchPort/          Create it and put your own APK/OBB here (git-ignored)
 
 ## Documentation
 
+- [SD card setup](SETUP.md)
 - [Building from source](docs/BUILDING.md)
 - [Architecture](docs/ARCHITECTURE.md): how the loader, bridges and renderer fit together
 - [Getting the Quest files](docs/QUEST_FILES.md)

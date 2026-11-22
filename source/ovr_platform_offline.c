@@ -156,6 +156,29 @@ static const void *ovr_Message_GetPurchaseArray(const OvrMessage *m) { return m;
 static size_t ovr_PurchaseArray_GetSize(const void *h) { (void)h; return 0; }
 static int ovr_PurchaseArray_HasNextPage(const void *h) { (void)h; return 0; }
 static const char *ovr_PurchaseArray_GetNextUrl(const void *h) { (void)h; return ""; }
+
+/* Multiplayer (official or BeatTogether via MultiplayerCore) builds its
+ * master-server AuthenticationToken from Users.GetUserProof(). A zero request
+ * id made that request fail, so the server browser never got a token and spun
+ * forever. Answer with a per-launch nonce; custom servers accept it. */
+#define OVR_MSG_USER_GET_USER_PROOF 0x22810483u
+static char g_user_proof[33];
+static uint64_t ovr_User_GetUserProof(void) {
+    if (!g_user_proof[0]) {
+        uint64_t a = ((uint64_t)rand() << 32) ^ (uint64_t)rand() ^
+                     (uint64_t)(uintptr_t)&a;
+        uint64_t b = ((uint64_t)rand() << 32) ^ (uint64_t)rand() ^ OVR_OFFLINE_USER_ID;
+        snprintf(g_user_proof, sizeof g_user_proof, "%016llx%016llx",
+                 (unsigned long long)a, (unsigned long long)b);
+    }
+    debugPrintf("[ovr:offline] user proof requested\n");
+    return ovr_post(OVR_MSG_USER_GET_USER_PROOF);
+}
+static const void *ovr_Message_GetUserProof(const OvrMessage *m) { return m; }
+static const char *ovr_UserProof_GetNonce(const void *h) {
+    (void)h;
+    return g_user_proof;
+}
 static const struct { const char *name; void *fn; } g_impl[] = {
 #define E(n) {#n, (void *)n}
     E(ovr_UnityInitWrapperAsynchronous),
@@ -199,6 +222,9 @@ static const struct { const char *name; void *fn; } g_impl[] = {
     E(ovr_PurchaseArray_GetSize),
     E(ovr_PurchaseArray_HasNextPage),
     E(ovr_PurchaseArray_GetNextUrl),
+    E(ovr_User_GetUserProof),
+    E(ovr_Message_GetUserProof),
+    E(ovr_UserProof_GetNonce),
 #undef E
 };
 
